@@ -1,32 +1,34 @@
-// Isolated world. No intervals, network, keys, arbitrary selectors or page-message bridge.
-(() => {
-  if (globalThis.__gaTotpActive) return;
+// Bundled with exactly one site strategy. Runs in the isolated content world.
+export function start(strategy) {
+  const serviceId = strategy.constructor.id;
+  if (globalThis.__gaTotpActive || !strategy.isAuthPage()) return;
+  // Ordinary pages exit above: no messages, listeners, observers or timers.
   globalThis.__gaTotpActive = true;
-  let observer, deadline, busy = false, queued = false, armed = false, service = null;
-  const visible = el => !el.disabled && !el.readOnly && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
-  function fields() {
-    if (service === 'gosuslugi') {
-      if (location.origin !== 'https://esia.gosuslugi.ru' || !location.pathname.startsWith('/login') || !/TOTP|код[^.\n]{0,120}из\s+приложени|приложени[^.\n]{0,120}код/i.test(document.body?.innerText || '')) return [];
-      const list = [...document.querySelectorAll('input[autocomplete="one-time-code"]')].filter(visible);
-      return [1,6,8].includes(list.length) ? list : [];
-    }
-    const list = [...document.querySelectorAll('input[name="USER_OTP"]')].filter(visible);
-    return service === 'bitrix' && list.length === 1 ? list : [];
-  }
-  function stop() { observer?.disconnect(); observer = null; clearTimeout(deadline); armed = false; }
+  let observer, deadline, busy = false, queued = false, rerun = false, armed = false, generation = 0;
+  const visible = el => el.isConnected && !el.disabled && !el.readOnly && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
+  const fields = () => strategy.isAuthPage() ? strategy.fields(visible) : [];
+  const sameOrigin = form => !form || new URL(form.getAttribute('action') || location.href,location.href).origin === location.origin;
+  function stop() { observer?.disconnect(); observer = null; clearTimeout(deadline); armed = false; generation++; }
   async function attempt() {
     queued = false;
     if (!armed || busy || document.hidden) return;
+    if (!strategy.isAuthPage()) { dispose({type:'ga-disable'}); return; }
     const list = fields();
-    if (!list.length || list.some(el => el.value)) return;
+    if (!list.length || list.some(el => el.value || !sameOrigin(el.form))) return;
     busy = true;
+    const token = generation, url = location.href;
     try {
-      const response = await chrome.runtime.sendMessage({type:'otp-ready',service});
+      const response = await chrome.runtime.sendMessage({type:'otp-ready',service:serviceId});
+      if (token !== generation) return;
       if (response?.authenticationRequested) { stop(); return; }
-      if (!armed || !response?.ok || !/^\d{6}(\d{2})?$/.test(response.code) || response.validUntil <= Date.now() || document.hidden) return;
+      if (!armed || !response?.ok || response.service !== serviceId || !/^\d{6}(\d{2})?$/.test(response.code) || response.validUntil <= Date.now() || document.hidden || location.href !== url) return;
       const current = fields();
-      if (current.length !== list.length || current.some((el,i) => el !== list[i] || el.value) || (current.length > 1 && current.length !== response.code.length)) return;
+      if (current.length !== list.length || current.some((el,i) => el !== list[i] || el.value || !sameOrigin(el.form)) || (current.length > 1 && current.length !== response.code.length)) return;
       stop();
+      const completed = generation, form = current[0].form;
+      let submitted = false;
+      const onSubmit = () => { submitted = true; };
+      form?.addEventListener('submit',onSubmit,true);
       const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;
       for (let i = 0; i < current.length; i++) {
         const el = current[i], value = current.length === 1 ? response.code : response.code[i];
@@ -34,40 +36,51 @@
         el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));
         el.dispatchEvent(new Event('change',{bubbles:true}));
       }
-      // Never submit. The site itself may continue after receiving the last digit.
-    } catch { stop(); } finally { busy = false; }
+      // Allow input handlers to update UI, then click once without retry/polling.
+      queueMicrotask(() => {
+        try {
+          if (submitted || completed !== generation || !globalThis.__gaTotpActive || document.hidden || location.href !== url || response.validUntil <= Date.now()) return;
+          const now = fields();
+          if (now.length !== current.length || now.some((el,i) => el !== current[i] || el.value !== (now.length === 1 ? response.code : response.code[i]) || !sameOrigin(el.form))) return;
+          const button = strategy.submit(now,visible);
+          if (button && visible(button) && button.form === form && sameOrigin(form)) button.click();
+        } finally { form?.removeEventListener('submit',onSubmit,true); dispose({type:'ga-disable'}); }
+      });
+    } catch { stop(); } finally { busy = false; if (rerun) { rerun = false; schedule(); } }
   }
-  function schedule() { if (!queued && armed) { queued = true; queueMicrotask(attempt); } }
-  function arm(s) {
-    stop(); service = s; armed = true; schedule();
+  function schedule() {
+    if (!armed) return;
+    if (busy) { rerun = true; return; }
+    if (!queued) { queued = true; queueMicrotask(attempt); }
+  }
+  function arm(service) {
+    if (service !== serviceId || !strategy.isAuthPage()) return;
+    stop(); armed = true; schedule();
     observer = new MutationObserver(schedule);
     observer.observe(document.body,{childList:true,subtree:true});
-    // Only a bounded transition after the user's login action, not idle polling.
     deadline = setTimeout(stop,15000);
   }
   async function loginAction() {
-    try { const r = await chrome.runtime.sendMessage({type:'login-click'}); if (r?.ok && globalThis.__gaTotpActive) arm(r.service); } catch { stop(); }
+    const token = generation;
+    try { const r = await chrome.runtime.sendMessage({type:'login-click'}); if (r?.ok && token === generation && globalThis.__gaTotpActive) arm(r.service); } catch { stop(); }
   }
-  function authContext(target) {
-    const url = new URL(location.href);
-    const loginRoute = /(?:^|\/)(?:login|auth|authorization)(?:\/|$)/i.test(url.pathname) || ['login','login_form','auth'].some(k => /^(yes|y|true|1)$/i.test(url.searchParams.get(k) || ''));
-    const form = target.closest?.('form');
-    return loginRoute || !!form?.querySelector('input[type="password"],input[name="USER_LOGIN"],input[name="USER_PASSWORD"],input[name="USER_OTP"],input[name="AUTH_FORM"]');
-  }
-  function alreadyFilled(target) {
-    const scope = target.closest?.('form') || document;
-    return [...scope.querySelectorAll('input[name="USER_OTP"],input[autocomplete="one-time-code"]')].some(el => visible(el) && el.value);
-  }
+  function alreadyFilled() { return fields().some(el => el.value); }
   function clicked(e) {
     if (!e.isTrusted) return;
+    if (!strategy.isAuthPage()) { dispose({type:'ga-disable'}); return; }
     const button = e.target.closest?.('button,input[type="submit"],input[type="button"],a[role="button"]');
-    if (!button) return;
-    const text = (button.innerText || button.value || button.getAttribute('aria-label') || '').trim();
-    const explicitLogin = /^(войти(?:\s.*)?|вход|log\s?in|sign\s?in)$/i.test(text);
-    if ((explicitLogin || (/^продолжить$/i.test(text) && authContext(button))) && !alreadyFilled(button)) void loginAction();
+    if (button && strategy.loginAction(button) && !alreadyFilled()) {
+      // On an already-open OTP form, do not send an empty code while awaiting
+      // the worker. Password/login form submission remains entirely native.
+      if (fields().some(el => el.form === button.form && sameOrigin(el.form))) e.preventDefault();
+      void loginAction();
+    }
   }
   function entered(e) {
-    if (e.isTrusted && e.key === 'Enter' && e.target.closest?.('form') && e.target.matches('input:not([type="search"])') && authContext(e.target) && !alreadyFilled(e.target)) void loginAction();
+    if (e.isTrusted && e.key === 'Enter' && e.target.matches('input:not([type="search"])') && strategy.isAuthPage() && strategy.authTarget(e.target) && !alreadyFilled()) {
+      if (fields().some(el => el.form === e.target.form && sameOrigin(el.form))) e.preventDefault();
+      void loginAction();
+    }
   }
   function visibility() { if (!document.hidden && armed) schedule(); }
   function dispose(message) {
@@ -79,6 +92,5 @@
     chrome.runtime.onMessage.removeListener(dispose);
   }
   document.addEventListener('click',clicked,true); document.addEventListener('keydown',entered,true); document.addEventListener('visibilitychange',visibility); window.addEventListener('pagehide',stop); chrome.runtime.onMessage.addListener(dispose);
-  // One message on navigation: continue only an earlier trusted login click.
   chrome.runtime.sendMessage({type:'pending-login'}).then(r => { if (r?.ok && globalThis.__gaTotpActive) arm(r.service); }).catch(() => {});
-})();
+}

@@ -37,6 +37,12 @@ test('encrypted vault round trip, wrong password, tamper, unique IV',async()=>{c
 test('JSON/TXT export retains key and parameters',()=>{const a=normalizeAccount(account);assert.equal(parseBackup(JSON.stringify({format:'chrome-app-totp-plain',version:1,accounts:[a]}))[0].secret,secret);assert.ok(exportText([a]).includes(otpUri(a)));});
 test('Transfer URI safely handles colons in display names',()=>{for(const values of [{name:'work:mail',issuer:''},{name:'a:b',issuer:'ACME:team'}]){const a=normalizeAccount({...account,...values});const b=parseOtp(otpUri(a));for(const k of ['secret','algorithm','digits','period'])assert.equal(a[k],b[k]);assert.equal(b.name,a.name.replaceAll(':',' · '));assert.equal(b.issuer,a.issuer.replaceAll(':',' · '));assert.equal(a.name,values.name);}});
 test('bindings are exact HTTPS origins and unique; Gosuslugi singleton',()=>{assert.deepEqual(normalizeBinding({service:'gosuslugi'}),{service:'gosuslugi',origin:'https://esia.gosuslugi.ru'});assert.equal(normalizeBinding({service:'bitrix',origin:'https://other.example.ru/path?login=yes'}).origin,'https://other.example.ru');for(const origin of ['http://example.ru','https://u:p@example.ru','https://example.ru:8443'])assert.throws(()=>normalizeBinding({service:'bitrix',origin}));assert.throws(()=>validateBindings([{binding:{origin:'https://a.ru'}},{binding:{origin:'https://a.ru'}}]));});
+test('OpenAI binding fixes the sign-in origin and remains unique',()=>{
+ assert.deepEqual(normalizeBinding({service:'openai',origin:'https://untrusted.example.test'}),{service:'openai',origin:'https://auth.openai.com'});
+ const a=normalizeAccount({...account,binding:{service:'openai'}});
+ assert.throws(()=>validateBindings([a,normalizeAccount({...account,name:'Second',binding:{service:'openai'}})]));
+ assert.equal(parseBackup(JSON.stringify({format:'chrome-app-totp-plain',version:1,accounts:[a]}))[0].binding.origin,'https://auth.openai.com');
+});
 
 test('Google QR export restores all multipart records in order without local metadata',()=>{
  const original=Array.from({length:27},(_,i)=>normalizeAccount({...account,name:'Account '+i,secret:encode32(str('Synthetic secret '+i)),binding:{service:'bitrix',origin:'https://example.org'}}));

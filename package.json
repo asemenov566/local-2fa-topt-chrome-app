@@ -1,13 +1,15 @@
 {
   "name": "chrome-app-totp",
-  "version": "1.4.3",
+  "version": "1.5.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test tests/core.test.mjs tests/pin-crypto.test.mjs tests/device-key.test.mjs",
+    "test": "node --test tests/core.test.mjs tests/pin-crypto.test.mjs tests/device-key.test.mjs tests/strategy-build.test.mjs",
     "test:browser": "node tests/run-browser-tests.cjs",
     "build:vendor": "node scripts/build-vendor.cjs",
     "build:icons": "node scripts/build-icons.cjs",
+    "build:strategies": "node scripts/build-strategies.mjs",
+    "check:strategies": "node scripts/build-strategies.mjs --check",
     "build:native": "powershell -NoProfile -File native/Build.ps1",
     "test:native": "node --test tests/native.test.cjs",
     "test:native:browser": "node tests/native-browser.cjs",

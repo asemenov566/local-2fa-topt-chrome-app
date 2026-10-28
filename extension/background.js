@@ -2,6 +2,8 @@ import {normalizeAccount,validateBindings,totp} from './core.js';
 import {loadVault,publishVaultMeta,vaultToken,fileStatus,setVaultPath} from './vault.js';
 import {nativeFile} from './native.js';
 import {recallKey,rememberKey,lockEpoch} from './security.js';
+import {strategyScripts,strategyRoute} from './strategy/registry.js';
+import {sessionAlive,installSessionManager,enforceSessionDeadline,closeSessionView} from './session.js';
 const SESSION='autofillSession';
 const ready=Promise.all([chrome.storage.local.setAccessLevel({accessLevel:'TRUSTED_CONTEXTS'}),chrome.storage.session.setAccessLevel({accessLevel:'TRUSTED_CONTEXTS'})]);
 let queue=Promise.resolve();
@@ -23,7 +25,7 @@ async function notifyBindings(type,bindings){
   for(const b of bindings) for(const tab of await chrome.tabs.query({url:b.origin+'/*'})) if(tab.id) try{await chrome.tabs.sendMessage(tab.id,{type,service:b.service});}catch{}
 }
 async function disable(){
-  await chrome.storage.session.remove(SESSION);await chrome.scripting.unregisterContentScripts();
+  await chrome.storage.session.remove([SESSION,'loginIntents','authRequest']);await chrome.scripting.unregisterContentScripts();
   const {autofillBindings=[]}=await chrome.storage.local.get('autofillBindings');await notifyBindings('ga-disable',autofillBindings);
 }
 async function prepareNewVault(){
@@ -36,29 +38,34 @@ async function prepareNewVault(){
       const stale=Object.keys(local).length>0||['uiUnlock','loginIntents','authRequest','importWindowDrafts'].some(k=>session[k]!==undefined);
       await chrome.storage.local.remove(['vaultMeta','deviceKey','passkeyConfig','passwordAttemptGate']);
       await chrome.storage.session.remove(['uiUnlock',SESSION,'loginIntents','authRequest','importWindowDrafts']);
-      await chrome.storage.local.set({protectedMode:true,autoEnabled:false,autofillBindings:[]});
+      await chrome.storage.local.set({protectedMode:true,sessionLifetime:60,autoEnabled:false,autofillBindings:[]});
+      await chrome.storage.session.remove('pendingSessionPolicy');
       if(stale)await chrome.storage.session.set({manualLock:true,lockEpoch:Math.max(Date.now(),(session.lockEpoch??0)+1)});
     });
     return {ok:true,exists:false};
   });
 }
 async function registrations(){
+  const generation=lockGeneration;
   const {autoEnabled,autofillBindings=[]}=await chrome.storage.local.get(['autoEnabled','autofillBindings']);
   if(!autoEnabled){await disable();return;}
-  const allowed=[];for(const b of autofillBindings)if(await chrome.permissions.contains({origins:[b.origin+'/*']}))allowed.push(b);
-  const desired=allowed.map((b,i)=>({id:'ga-'+i,matches:[b.origin+'/*'],js:['autofill.js'],allFrames:false,runAt:'document_idle',persistAcrossSessions:true}));
+  const allowed=[];for(const b of autofillBindings)if(strategyScripts(b.service).length&&await chrome.permissions.contains({origins:[b.origin+'/*']}))allowed.push(b);
+  const desired=allowed.map((b,i)=>({id:'ga-'+i,matches:[b.origin+'/*'],js:strategyScripts(b.service),allFrames:false,runAt:'document_idle',persistAcrossSessions:true}));
   const current=await chrome.scripting.getRegisteredContentScripts();
-  if(JSON.stringify(current.map(s=>s.matches).sort())!==JSON.stringify(desired.map(s=>s.matches).sort())){await chrome.scripting.unregisterContentScripts();if(desired.length)await chrome.scripting.registerContentScripts(desired);}
-  for(const b of allowed)for(const tab of await chrome.tabs.query({url:b.origin+'/*'}))if(tab.id)try{await chrome.scripting.executeScript({target:{tabId:tab.id},files:['autofill.js']});}catch{}
+  if(generation!==lockGeneration)return;
+  const signature=scripts=>JSON.stringify(scripts.map(s=>({id:s.id,matches:s.matches,js:s.js})).sort((a,b)=>a.id.localeCompare(b.id)));
+  if(signature(current)!==signature(desired)){await chrome.scripting.unregisterContentScripts();if(desired.length)await chrome.scripting.registerContentScripts(desired);}
+  for(const b of allowed)for(const tab of await chrome.tabs.query({url:b.origin+'/*'})){if(generation!==lockGeneration)return;if(tab.id)try{await chrome.scripting.executeScript({target:{tabId:tab.id},files:strategyScripts(b.service)});}catch{}}
 }
 async function activate(accounts,revision,token){
+  await enforceSessionDeadline();
   const generation=lockGeneration;
   await ready;const {vaultMeta,autoEnabled}=await chrome.storage.local.get(['vaultMeta','autoEnabled']);
   const unlocked=await chrome.storage.session.get(['uiUnlock','manualLock','lockEpoch']);if(!unlocked.uiUnlock||unlocked.manualLock)return {ok:false,error:'Хранилище заблокировано.'};
   if(!vaultMeta||vaultMeta.revision!==revision||vaultMeta.token!==token)return {ok:false,error:'Файл изменился. Откройте его снова.'};
   const selected=accounts.map(normalizeAccount).filter(a=>a.binding);validateBindings(selected);
   const old=(await chrome.storage.local.get('autofillBindings')).autofillBindings??[];
-  const bindings=selected.map(a=>({id:a.id,...a.binding}));await notifyBindings('ga-disable',old.filter(b=>!bindings.some(n=>n.origin===b.origin)));
+  const bindings=selected.map(a=>({id:a.id,...a.binding}));await notifyBindings('ga-disable',old.filter(b=>!bindings.some(n=>n.origin===b.origin&&n.service===b.service&&n.id===b.id)));
   await chrome.storage.local.set({autofillBindings:bindings});
   if(!autoEnabled){await disable();return {ok:true,expires:0,enabled:0};}
   const allowed=[];for(const a of selected)if(await chrome.permissions.contains({origins:[a.binding.origin+'/*']}))allowed.push(a);
@@ -66,13 +73,14 @@ async function activate(accounts,revision,token){
     const current=await chrome.storage.session.get(['uiUnlock','manualLock','lockEpoch']);
     const latest=await chrome.storage.local.get(['vaultMeta','autoEnabled']);
     if(generation!==lockGeneration||current.manualLock||!current.uiUnlock||(current.lockEpoch??0)!==(unlocked.lockEpoch??0)||latest.vaultMeta?.token!==token||!latest.autoEnabled)return false;
-    await chrome.storage.session.set({[SESSION]:{accounts:allowed,revision,token,expires:Number.MAX_SAFE_INTEGER}});return true;
+    if(!sessionAlive(current.uiUnlock))return false;
+    await chrome.storage.session.set({[SESSION]:{accounts:allowed,revision,token,expires:current.uiUnlock.expiresAt||Number.MAX_SAFE_INTEGER}});return true;
   });
   if(!committed)return {ok:false,error:'Хранилище заблокировано.'};
   await registrations();
   const {loginIntents={}}=await chrome.storage.session.get('loginIntents');
   for(const [tabId,intent] of Object.entries(loginIntents))if(intent.until>Date.now())try{await chrome.tabs.sendMessage(Number(tabId),{type:'ga-resume',service:intent.service});}catch{}
-  return {ok:true,expires:allowed.length?Number.MAX_SAFE_INTEGER:0,enabled:allowed.length};
+  return {ok:true,expires:allowed.length?(unlocked.uiUnlock.expiresAt||Number.MAX_SAFE_INTEGER):0,enabled:allowed.length};
 }
 async function promptUnlock(tabId,intent,generation,epoch){
   const request={id:crypto.randomUUID(),tabId,origin:intent.origin,until:Date.now()+120000};
@@ -94,13 +102,14 @@ async function promptUnlock(tabId,intent,generation,epoch){
   }catch{await navigator.locks.request('chrome-app-totp-security',async()=>{if((await chrome.storage.session.get('authRequest')).authRequest?.id===request.id)await chrome.storage.session.remove('authRequest');});}
 }
 async function pageAction(m,sender){
+  await enforceSessionDeadline();
   const generation=lockGeneration;
   await ready;if(!sender.tab||sender.frameId!==0||!sender.url)return {ok:false};
   const epoch=await lockEpoch();
   const url=new URL(sender.url);if(url.protocol!=='https:')return {ok:false};
   const {autoEnabled,autofillBindings=[],vaultMeta}=await chrome.storage.local.get(['autoEnabled','autofillBindings','vaultMeta']);if(!autoEnabled)return {ok:false};
   const binding=autofillBindings.find(b=>b.origin===url.origin);if(!binding||!(await chrome.permissions.contains({origins:[url.origin+'/*']})))return {ok:false};
-  if(binding.service==='gosuslugi'&&!url.pathname.startsWith('/login'))return {ok:false};
+  if(!strategyRoute(binding.service,url,m.type==='otp-ready'))return {ok:false};
   const {loginIntents={}}=await chrome.storage.session.get('loginIntents');const tabKey=String(sender.tab.id);
   if(m.type==='login-click')return navigator.locks.request('chrome-app-totp-security',async()=>{
     if(generation!==lockGeneration||await lockEpoch()!==epoch)return {ok:false};
@@ -125,24 +134,40 @@ async function pageAction(m,sender){
   const a=s.accounts.find(a=>a.id===binding.id&&a.binding.origin===url.origin);if(!a)return {ok:false};
   const at=Date.now(),code=await totp(a,at),validUntil=(Math.floor(at/1000/a.period)+1)*a.period*1000;if(Date.now()>=validUntil)return {ok:false};
   return navigator.locks.request('chrome-app-totp-security',async()=>{
-    const current=await chrome.storage.session.get(['manualLock','lockEpoch',SESSION,'loginIntents']);
-    if(generation!==lockGeneration||current.manualLock||(current.lockEpoch??0)!==(state.lockEpoch??0)||current[SESSION]?.token!==s.token||Date.now()>=validUntil)return {ok:false};
+    const current=await chrome.storage.session.get(['manualLock','lockEpoch',SESSION,'loginIntents','uiUnlock']);
+    const latest=await chrome.storage.local.get(['autoEnabled','autofillBindings']);
+    if(!latest.autoEnabled||!latest.autofillBindings?.some(b=>b.id===binding.id&&b.origin===binding.origin&&b.service===binding.service)||!(await chrome.permissions.contains({origins:[url.origin+'/*']})))return {ok:false};
+    if(generation!==lockGeneration||current.manualLock||!sessionAlive(current.uiUnlock)||(current.lockEpoch??0)!==(state.lockEpoch??0)||current[SESSION]?.token!==s.token||Date.now()>=validUntil)return {ok:false};
     const intents=current.loginIntents??{};if(!intents[tabKey]||intents[tabKey].until<=Date.now())return {ok:false};
     delete intents[tabKey];await chrome.storage.session.set({loginIntents:intents});return {ok:true,code,service:binding.service,validUntil};
   });
 }
-async function lockVault(){
+async function lockVault(expectedSession,afterSave=false){
   await ready;
-  await navigator.locks.request('chrome-app-totp-security',async()=>{
+  const locked=await navigator.locks.request('chrome-app-totp-security',async()=>{
+    if(expectedSession){
+      const {uiUnlock,lockEpoch=0}=await chrome.storage.session.get(['uiUnlock','lockEpoch']);
+      if(!uiUnlock||uiUnlock.authenticatedAt!==expectedSession.authenticatedAt)return false;
+      if(afterSave){
+        if(!Number.isFinite(expectedSession.authenticatedAt)||!Number.isFinite(expectedSession.lockEpoch)||typeof expectedSession.salt!=='string'||lockEpoch!==expectedSession.lockEpoch||uiUnlock.salt!==expectedSession.salt)return false;
+      }else if(uiUnlock.expiresAt!==expectedSession.expiresAt||sessionAlive(uiUnlock))return false;
+      lockGeneration++;
+    }
     const {lockEpoch=0}=await chrome.storage.session.get('lockEpoch');
-    await chrome.storage.session.remove([SESSION,'uiUnlock','loginIntents','authRequest','importWindowDrafts']);
+    await chrome.storage.session.remove([SESSION,'uiUnlock','loginIntents','authRequest','importWindowDrafts','pendingSessionPolicy']);
     await chrome.storage.session.set({lockEpoch:Math.max(Date.now(),lockEpoch+1),manualLock:true});
+    return true;
   });
+  if(!locked)return {ok:false};
   const {autofillBindings=[]}=await chrome.storage.local.get('autofillBindings');await notifyBindings('ga-reset',autofillBindings);return {ok:true};
 }
+installSessionManager(lockVault);
 chrome.runtime.onMessage.addListener((m,sender,reply)=>{
   if(sender.id!==chrome.runtime.id||!m||typeof m!=='object')return;
   const trusted=sender.url&&sender.url.split('?')[0].split('#')[0]===chrome.runtime.getURL('app.html');
+  if(trusted&&m.type==='session-expire'){void lockVault({authenticatedAt:m.authenticatedAt,expiresAt:m.expiresAt}).then(reply,()=>reply({ok:false}));return true;}
+  if(trusted&&m.type==='lock-after-save'){if(!m.expected||typeof m.expected!=='object'){reply({ok:false});return;}void lockVault(m.expected,true).then(reply,()=>reply({ok:false}));return true;}
+  if(trusted&&m.type==='session-view-closing'){void closeSessionView(sender.documentId).then(()=>reply({ok:true}),()=>reply({ok:false}));return true;}
   if(trusted&&m.type==='lock'){lockGeneration++;void lockVault().then(reply,()=>reply({ok:false,error:'Не удалось завершить блокировку.'}));return true;}
   // The worker owns the native dialog, so closing the action popup cannot cancel
   // the choice. Do not put user interaction in the autofill/lock serial queue.
@@ -165,13 +190,24 @@ async function boot(){
   try{const epoch=await lockEpoch();const v=await loadVault();if(!v)return;const unlocked=await recallKey(v,false);if(!unlocked)return;await rememberKey(unlocked.key,v.salt,false,epoch);await publishVaultMeta(v);await activate(unlocked.accounts,v.revision,vaultToken(v));}catch{}
 }
 chrome.runtime.onStartup.addListener(()=>{void serial(boot);});chrome.runtime.onInstalled.addListener(()=>{void serial(boot);});
-chrome.permissions.onRemoved.addListener(()=>{void serial(async()=>{await disable();await registrations();});});
+function interruptAutofill(){
+  lockGeneration++;
+  // Detach pages now, even if a native read occupies the worker's serial queue.
+  void chrome.storage.local.get('autofillBindings').then(({autofillBindings=[]})=>notifyBindings('ga-disable',autofillBindings));
+}
+chrome.permissions.onRemoved.addListener(()=>{interruptAutofill();void serial(async()=>{await disable();await registrations();});});
 chrome.storage.onChanged.addListener((c,a)=>{
+  if(a==='session'&&c.uiUnlock?.newValue)void navigator.locks.request('chrome-app-totp-security',async()=>{
+    const state=await chrome.storage.session.get(['uiUnlock','manualLock',SESSION]);
+    const {vaultMeta}=await chrome.storage.local.get('vaultMeta');
+    const active=state[SESSION],expires=state.uiUnlock?.expiresAt||Number.MAX_SAFE_INTEGER;
+    if(active&&!state.manualLock&&sessionAlive(state.uiUnlock)&&active.token===vaultMeta?.token&&active.expires!==expires)await chrome.storage.session.set({[SESSION]:{...active,expires}});
+  });
   if(a!=='local')return;
-  if(c.autoEnabled)void serial(c.autoEnabled.newValue===true?registrations:disable);
+  if(c.autoEnabled){if(c.autoEnabled.newValue===true)void serial(registrations);else{interruptAutofill();void serial(disable);}}
   if(c.autofillBindings)void serial(async()=>{
     const next=c.autofillBindings.newValue??[];
-    await notifyBindings('ga-disable',(c.autofillBindings.oldValue??[]).filter(b=>!next.some(n=>n.origin===b.origin)));
+    await notifyBindings('ga-disable',(c.autofillBindings.oldValue??[]).filter(b=>!next.some(n=>n.origin===b.origin&&n.service===b.service&&n.id===b.id)));
     await registrations();
   });
 });

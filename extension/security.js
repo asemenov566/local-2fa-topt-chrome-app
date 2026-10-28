@@ -1,5 +1,6 @@
 import {exportKey,importKey,unsealWithKey} from './vault.js';
 import {nativeFile} from './native.js';
+import {sessionAlive,sessionLifetime,reconcileSessionPolicy} from './session.js';
 const to64 = bytes => btoa(Array.from(new Uint8Array(bytes),b => String.fromCharCode(b)).join(''));
 const from64 = s => Uint8Array.from(atob(s),c => c.charCodeAt(0));
 export async function lockEpoch() { return (await chrome.storage.session.get('lockEpoch')).lockEpoch ?? 0; }
@@ -9,21 +10,29 @@ const cancelled = () => new Error('Разблокировка отменена: 
 const validDevice = d => !!d && typeof d === 'object' && d.version === 1 && d.protection === 'windows-dpapi' && typeof d.wrapped === 'string' && d.wrapped.length <= 5464 && !('raw' in d);
 const sameDevice = (a,b) => validDevice(a) && validDevice(b) && a.salt === b.salt && a.wrapped === b.wrapped;
 async function checkPrepared(record) {
-  const session = await chrome.storage.session.get(['manualLock','lockEpoch']);
+  const session = await chrome.storage.session.get(['manualLock','lockEpoch','uiUnlock']);
   const prefs = await chrome.storage.local.get('protectedMode');
+  if (record.expiresAt && record.expiresAt <= Date.now()) throw cancelled();
+  if (record.previous && (!sessionAlive(session.uiUnlock) || session.uiUnlock.authenticatedAt !== record.previous.authenticatedAt || session.uiUnlock.expiresAt !== record.previous.expiresAt)) throw cancelled();
   if ((session.lockEpoch ?? 0) !== record.epoch || (record.implicit && session.manualLock) || (prefs.protectedMode !== false) !== record.protectedMode) throw cancelled();
 }
 // Prepare before changing a password on disk. Native calls never hold the lock
 // needed by another window to hide codes and erase its unlocked session.
-export async function prepareRememberKey(key,salt,authEpoch) {
+export async function prepareRememberKey(key,salt,authEpoch,options = {}) {
   const record = await securityLock(async () => {
-    const session = await chrome.storage.session.get(['manualLock','lockEpoch']);
+    const session = await chrome.storage.session.get(['manualLock','lockEpoch','uiUnlock']);
     const epoch = session.lockEpoch ?? 0;
     if (authEpoch !== undefined ? authEpoch !== epoch : session.manualLock) throw cancelled();
-    const prefs = await chrome.storage.local.get('protectedMode');
-    return {key,salt,epoch,implicit:authEpoch === undefined,protectedMode:prefs.protectedMode !== false};
+    const prefs = await chrome.storage.local.get(['protectedMode','sessionLifetime']);
+    if (!options.freshAuthentication && session.uiUnlock && !sessionAlive(session.uiUnlock)) throw cancelled();
+    const previous = !options.freshAuthentication ? session.uiUnlock : null;
+    const authenticatedAt = previous?.authenticatedAt ?? Date.now();
+    const seconds = sessionLifetime(prefs);
+    const expiresAt = previous?.expiresAt ?? (seconds === 0 ? 0 : authenticatedAt + seconds*1000);
+    const requiresOldPassword = previous?.requiresOldPassword ?? (!options.freshAuthentication && prefs.protectedMode === false);
+    return {key,salt,epoch,implicit:authEpoch === undefined,protectedMode:prefs.protectedMode !== false,previous,authenticatedAt,expiresAt,requiresOldPassword};
   });
-  record.saved = {raw:await exportKey(key),salt};
+  record.saved = {raw:await exportKey(key),salt,authenticatedAt:record.authenticatedAt,expiresAt:record.expiresAt,requiresOldPassword:record.requiresOldPassword};
   if (!record.protectedMode) {
     const result = await nativeFile({op:'protect-key',key:record.saved.raw});
     if (typeof result.wrapped !== 'string' || result.wrapped.length > 5464) throw new Error('Не удалось защитить ключ на этом компьютере.');
@@ -32,23 +41,25 @@ export async function prepareRememberKey(key,salt,authEpoch) {
   await securityLock(() => checkPrepared(record));
   const token = Object.freeze({}); preparedKeys.set(token,record); return token;
 }
-export async function rememberKey(key,salt,protectedMode,authEpoch,preparedToken) {
-  const token = preparedToken ?? await prepareRememberKey(key,salt,authEpoch);
+export async function rememberKey(key,salt,protectedMode,authEpoch,preparedToken,options = {}) {
+  const token = preparedToken ?? await prepareRememberKey(key,salt,authEpoch,options);
   const record = preparedKeys.get(token); preparedKeys.delete(token);
   if (!record || record.key !== key || record.salt !== salt || (authEpoch !== undefined && record.epoch !== authEpoch)) throw cancelled();
   await securityLock(async () => {
     await checkPrepared(record);
+    if (!record.previous) await chrome.storage.session.remove('pendingSessionPolicy');
     await chrome.storage.session.set({uiUnlock:record.saved,manualLock:false});
     if (record.protectedMode) await chrome.storage.local.remove('deviceKey');
     else await chrome.storage.local.set({deviceKey:record.device});
   });
 }
 export async function recallKey(v,protectedMode) {
+  await reconcileSessionPolicy();
   const snapshot = await securityLock(async () => {
     const session = await chrome.storage.session.get(['uiUnlock','manualLock','lockEpoch']);
     const local = await chrome.storage.local.get(['deviceKey','protectedMode']);
     if (local.deviceKey && !validDevice(local.deviceKey)) await chrome.storage.local.remove('deviceKey');
-    if (session.manualLock) return null;
+    if (session.manualLock || (session.uiUnlock && !sessionAlive(session.uiUnlock))) return null;
     return {session:session.uiUnlock,device:local.deviceKey,epoch:session.lockEpoch ?? 0,protectedMode:local.protectedMode !== false};
   });
   if (!snapshot) return null;
@@ -74,9 +85,30 @@ export async function recallKey(v,protectedMode) {
   return securityLock(async () => {
     const session = await chrome.storage.session.get(['uiUnlock','manualLock','lockEpoch']);
     const local = await chrome.storage.local.get(['deviceKey','protectedMode']);
-    if (session.manualLock || (session.lockEpoch ?? 0) !== snapshot.epoch || (local.protectedMode !== false) !== snapshot.protectedMode) return null;
+    if (session.manualLock || (fromSession && !sessionAlive(session.uiUnlock)) || (session.lockEpoch ?? 0) !== snapshot.epoch || (local.protectedMode !== false) !== snapshot.protectedMode) return null;
     if (fromSession ? session.uiUnlock?.salt !== snapshot.session.salt || session.uiUnlock?.raw !== snapshot.session.raw : !sameDevice(local.deviceKey,snapshot.device)) return null;
     return unlocked;
+  });
+}
+export async function changeSessionLifetime(key,salt,seconds,documentId) {
+  if (![0,30,60,300].includes(seconds) || typeof documentId !== 'string' || !documentId) throw new Error('Не удалось определить окно приложения. Откройте его заново.');
+  const epoch = await lockEpoch(), raw = await exportKey(key);
+  let device;
+  if (seconds === 0) {
+    const result = await nativeFile({op:'protect-key',key:raw});
+    if (typeof result.wrapped !== 'string' || result.wrapped.length > 5464) throw new Error('Не удалось защитить ключ на этом компьютере.');
+    device = {version:1,protection:'windows-dpapi',salt,wrapped:result.wrapped};
+  }
+  await securityLock(async () => {
+    const state = await chrome.storage.session.get(['uiUnlock','manualLock','lockEpoch']);
+    if (state.manualLock || (state.lockEpoch ?? 0) !== epoch || !sessionAlive(state.uiUnlock) || state.uiUnlock.salt !== salt || state.uiUnlock.raw !== raw) throw cancelled();
+    if (seconds === 0) await chrome.storage.local.set({deviceKey:device});
+    else await chrome.storage.local.remove('deviceKey');
+    if (seconds === 0) await chrome.storage.session.set({uiUnlock:{...state.uiUnlock,requiresOldPassword:true}});
+    // Save immediately, apply the new deadline only when the owning document closes.
+    await chrome.storage.session.set({pendingSessionPolicy:{id:crypto.randomUUID(),documentId,authenticatedAt:state.uiUnlock.authenticatedAt}});
+    await chrome.storage.local.set({sessionLifetime:seconds,protectedMode:seconds !== 0});
+    if (seconds === 0) await chrome.storage.local.remove('passkeyConfig');
   });
 }
 function capability() {

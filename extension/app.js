@@ -5,15 +5,36 @@ import {createQRReader} from './qr-reader.js';
 import {migrationUris} from './migration-export.js';
 import {timerSector} from './timer.js';
 import {getPasswordGate,attemptPassword} from './auth-attempts.js';
-import {rememberKey,prepareRememberKey,recallKey,enrollPasskey,unlockPasskey,lockEpoch} from './security.js';
+import {rememberKey,prepareRememberKey,recallKey,enrollPasskey,unlockPasskey,lockEpoch,changeSessionLifetime} from './security.js';
+import {sessionAlive,sessionLifetime} from './session.js';
+import {strategyOptions,getStrategy} from './strategy/registry.js';
 const $ = id => document.getElementById(id);
+for (const item of strategyOptions) { const option = document.createElement('option'); option.value = item.id; option.textContent = item.displayName; $('service').append(option); }
+let sessionDocumentId, sessionPort;
+function connectSessionView() {
+  sessionPort = chrome.runtime.connect({name:'totp-session-view'});
+  sessionPort.onMessage.addListener(message => { if (message.documentId) sessionDocumentId = message.documentId; });
+}
+connectSessionView();
+let expiryTimer;
+async function watchSessionDeadline() {
+  clearTimeout(expiryTimer);
+  const {uiUnlock} = await chrome.storage.session.get('uiUnlock');
+  if (!key || !uiUnlock) return;
+  if (!sessionAlive(uiUnlock)) {
+    const result = await chrome.runtime.sendMessage({type:'session-expire',authenticatedAt:uiUnlock.authenticatedAt,expiresAt:uiUnlock.expiresAt});
+    if (result?.ok === false && key) void watchSessionDeadline();
+    return;
+  }
+  if (uiUnlock.expiresAt) expiryTimer = setTimeout(() => { void watchSessionDeadline(); },Math.max(1,uiUnlock.expiresAt-Date.now()));
+}
 const full = new URLSearchParams(location.search).has('full');
 if (full) document.body.classList.add('full');
 if (full) { document.querySelector('h1').textContent = 'CHROME-APP-TOTP'; $('menu-title').textContent = 'CHROME-APP-TOTP'; }
 const authOnly = new URLSearchParams(location.search).has('auth');
 if (authOnly) document.body.classList.add('auth-only');
 let accounts = [], key = null, salt = null, vault = null, revision = 0, generation = 0, editing = null;
-let idleTimer, tickTimer, toastTimer, lastActivity = Date.now(), autoExpires = 0, writing = false;
+let tickTimer, toastTimer, autoExpires = 0, writing = false;
 let rows = new Map(), pending = [], batch = new MigrationBatch(), importWarnings = [], encryptedImport = null, batchComplete = false;
 let cameraReader = null, fileScanAbort = new AbortController();
 let cameraStarted = 0, cameraLastDetected = 0, cameraLastEnhanced = 0, cameraMode = 'idle';
@@ -91,7 +112,7 @@ function lockLocal() {
   pinDraft = ''; clearTimeout(pinGateTimer); pinGateVersion++; $('password').value = ''; $('password-confirm').value = '';
   if (vault) { document.body.classList.add('pin-auth'); renderPinDots(); }
   reorderMode = false; draftOrder = []; orderBar.hidden = true; $('search').disabled = false; $('menu-button').disabled = false;
-  generation++; key = null; salt = null; accounts = []; rows.clear(); codeCache.clear(); clearTimeout(idleTimer); clearTimeout(tickTimer); stopCamera(); closeSensitiveDialogs();
+  generation++; key = null; salt = null; accounts = []; rows.clear(); codeCache.clear(); clearTimeout(tickTimer); clearTimeout(expiryTimer); stopCamera(); closeSensitiveDialogs();
   $('accounts').replaceChildren(); $('search').value = ''; $('codes-screen').hidden = true; $('lock-screen').hidden = false; $('lock-button').hidden = true; $('add-button').hidden = true; $('auto-toggle').disabled = false; updateAutoLabel();
   $('search-panel').hidden = true; $('search-toggle').hidden = true; $('search-toggle').disabled = false; $('search-toggle').setAttribute('aria-expanded','false');
 }
@@ -100,16 +121,12 @@ async function lock() {
   try { await chrome.runtime.sendMessage({type:'lock'}); autoExpires = 0; updateAutoLabel(); await configureLock(); }
   finally { localLockRequest = false; renderPinGate(); focusPin(); }
 }
-function touch() {
-  lastActivity = Date.now();
-}
 function updateAutoLabel() {
   const enabled = $('auto-toggle').checked;
   $('auto-status').textContent = !enabled ? 'Выключено · обычный аутентификатор' : Date.now() < autoExpires ? 'Активна в этой сессии Chrome' : key ? 'Привяжите сервис через шестерёнку' : 'Разблокируйте для автоустановки';
 }
 async function activateAuto() {
-  if (!$('auto-toggle').checked) { await chrome.runtime.sendMessage({type:'deactivate'}); autoExpires = 0; updateAutoLabel(); return; }
-  if (!key) { await chrome.runtime.sendMessage({type:'configure'}); autoExpires = 0; updateAutoLabel(); return; }
+  if (!key) { await chrome.runtime.sendMessage({type:$('auto-toggle').checked ? 'configure' : 'deactivate'}); autoExpires = 0; updateAutoLabel(); return; }
   const r = await chrome.runtime.sendMessage({type:'activate',accounts:accounts.filter(a => a.binding),revision,token:vaultToken(vault)});
   if (!r?.ok) throw new Error(r?.error || 'Не удалось включить автоустановку.');
   autoExpires = r.expires; updateAutoLabel();
@@ -119,19 +136,41 @@ async function persist(next, nextKey = key, nextSalt = salt, nextPasswordLength 
   if (next.length > 2000) throw new Error('Максимум 2000 аккаунтов.');
   validateBindings(next); writing = true;
   const token = generation;
+  let committed = false, originalSession;
   try {
-    const epoch = await lockEpoch();
+    const snapshot = await chrome.storage.session.get(['uiUnlock','lockEpoch']);
+    const epoch = snapshot.lockEpoch ?? 0;
+    if (!sessionAlive(snapshot.uiUnlock) || snapshot.uiUnlock.salt !== salt) throw new Error('Хранилище заблокировано.');
+    originalSession = {lockEpoch:epoch,authenticatedAt:snapshot.uiUnlock.authenticatedAt,salt:snapshot.uiUnlock.salt};
     const envelope = await seal(next,nextKey,nextSalt,revision + 1,nextPasswordLength);
     const preparedKey = await prepareRememberKey(nextKey,nextSalt,epoch);
     if (token !== generation) throw new Error('Хранилище заблокировано.');
     await saveVault(envelope,vaultToken(vault));
-    if (token !== generation) return;
-    vault = envelope; revision = envelope.revision; accounts = next; key = nextKey; salt = nextSalt; await rememberKey(key,salt,protectedMode,epoch,preparedKey);
-    if (token !== generation) return;
+    committed = true;
+    if (token !== generation) throw new Error('Сессия завершена после сохранения.');
+    await rememberKey(nextKey,nextSalt,protectedMode,epoch,preparedKey);
+    if (token !== generation) throw new Error('Сессия завершена после сохранения.');
+    vault = envelope; revision = envelope.revision; accounts = next; key = nextKey; salt = nextSalt;
     generation++; codeCache.clear(); renderAccounts(); if ($('settings-dialog').open) renderOrder();
+  } catch (error) {
+    if (!committed) throw error;
+    // A completed disk write is authoritative. Never report it as a failed change
+    // or revive an expired session merely to display the successful result.
+    const staleDocument = token === generation || !key;
+    if (staleDocument) { localLockRequest = true; lockLocal(); }
+    try {
+      const locked = await chrome.runtime.sendMessage({type:'lock-after-save',expected:originalSession});
+      if (!locked?.ok && nextSalt !== originalSession.salt) await chrome.runtime.sendMessage({type:'lock-after-save',expected:{...originalSession,salt:nextSalt}});
+      if (staleDocument) await configureLock();
+    } catch { if (staleDocument) void configureLock().catch(() => {}); }
+    finally { if (staleDocument) { localLockRequest = false; renderPinGate(); focusPin(); } }
+    return {committed:true,locked:staleDocument};
   } finally { writing = false; }
   try { await activateAuto(); } catch (e) { toast(e.message); }
+  return {committed:true,locked:false};
 }
+function committedMessage(message,result) { return result?.locked ? message + '. Сессия завершена. Войдите снова.' : message; }
+
 async function configureLock() {
   const setup = ++lockSetup;
   lockConfiguring = true; $('password').disabled = true; $('unlock-passkey').disabled = true;
@@ -161,7 +200,7 @@ async function configureLock() {
       if (!prepared?.ok) { const error = new Error(prepared?.error || 'Расширение обновлено. Нажмите «Перезапустить», затем снова откройте его значок.'); error.action = prepared?.error ? 'retry' : 'reload'; throw error; }
       if (prepared.exists) return configureLock();
       protectedMode = true; passkeyConfig = null;
-      $('protection-toggle').checked = false; $('passkey-toggle').checked = false; $('passkey-toggle').disabled = false;
+      $('session-lifetime').value = '60'; $('passkey-toggle').checked = false; $('passkey-toggle').disabled = false;
       $('passkey-setting').hidden = false; $('unlock-passkey').hidden = true;
       $('auto-toggle').checked = false; autoExpires = 0; updateAutoLabel();
     } catch (e) {
@@ -252,16 +291,16 @@ $('file-new').addEventListener('click',() => { void selectFile(true); });
 $('file-open').addEventListener('click',() => { void selectFile(false); });
 $('file-retry').addEventListener('click',() => { void configureLock(); });
 $('file-authorize').addEventListener('click',async () => { try { await authorizeFile(); await configureLock(); } catch (e) { $('lock-description').textContent = e.message; } });
-async function acceptUnlocked(unlocked,envelope,authEpoch) {
+async function acceptUnlocked(unlocked,envelope,authEpoch,freshAuthentication = true) {
   const token = generation;
   if (vaultToken(await loadVault()) !== vaultToken(envelope)) throw new Error('Файл изменился во время входа. Повторите разблокировку.');
-  await publishVaultMeta(envelope); await rememberKey(unlocked.key,unlocked.salt,protectedMode,authEpoch);
+  await publishVaultMeta(envelope); await rememberKey(unlocked.key,unlocked.salt,protectedMode,authEpoch,undefined,{freshAuthentication});
   if (token !== generation) throw new Error('Вход отменён из-за блокировки в другом окне.');
   key = unlocked.key; salt = unlocked.salt; accounts = unlocked.accounts; vault = envelope; revision = vault.revision; generation++;
   pinDraft = ''; pinBlockedUntil = 0; pinGateVersion++; clearTimeout(pinGateTimer); document.body.classList.remove('pin-auth','lock-error'); $('lock-alert').hidden = true;
   $('password').value = ''; $('password-confirm').value = ''; $('unlock-error').textContent = ''; $('lock-screen').hidden = true; $('codes-screen').hidden = false; $('lock-button').hidden = false; $('auto-toggle').disabled = false;
   $('search-toggle').hidden = false;
-  renderAccounts(); try { await activateAuto(); } catch (error) { toast(error.message); }
+  renderAccounts(); void watchSessionDeadline(); try { await activateAuto(); } catch (error) { toast(error.message); }
   if (authOnly) {
     await chrome.storage.session.remove('authRequest');
     const win = await chrome.windows.getCurrent(); await chrome.windows.remove(win.id); return;
@@ -328,7 +367,7 @@ function renderAccounts() {
     const svg = document.createElementNS('http://www.w3.org/2000/svg','svg'); svg.setAttribute('viewBox','0 0 32 32');
     const progress = document.createElementNS(svg.namespaceURI,'path'); svg.append(progress);
     timer.append(svg); line.append(code,timer); row.append(head,line);
-    if (a.binding) row.append(element('div','account-bound',a.binding.service === 'gosuslugi' ? 'Госуслуги · автоустановка' : new URL(a.binding.origin).hostname + ' · Битрикс'));
+    if (a.binding) row.append(element('div','account-bound',(getStrategy(a.binding.service)?.customDomain ? new URL(a.binding.origin).hostname + ' · ' : '') + (getStrategy(a.binding.service)?.displayName || a.binding.service)));
     root.append(row); rows.set(a.id,{code,timer,progress});
   }
   $('empty').hidden = accounts.length !== 0 || reorderMode; $('no-results').hidden = !accounts.length || rows.size !== 0 || reorderMode; $('add-button').hidden = !key || reorderMode;
@@ -354,9 +393,16 @@ async function tick() {
 function editAccount(a = null) {
   $('share-button').hidden = !a;
   if (!requireOpen()) return; editing = a?.id ?? null; $('edit-form').reset(); $('edit-error').textContent = ''; $('show-secret').checked = !a; $('secret').type = a ? 'password' : 'text';
-  $('edit-title').textContent = a ? 'Настройки аккаунта' : 'Новый аккаунт'; $('issuer').value = a?.issuer ?? ''; $('account-name').value = a?.name ?? ''; $('secret').value = a?.secret ?? ''; $('algorithm').value = a?.algorithm ?? 'SHA1'; $('digits').value = a?.digits ?? 6; $('period').value = a?.period ?? 30; $('service').value = a?.binding?.service ?? 'none'; $('site-url').value = a?.binding?.service === 'bitrix' ? a.binding.origin : ''; $('delete-button').hidden = !a; updateSite(); show('edit-dialog');
+  $('edit-title').textContent = a ? 'Настройки аккаунта' : 'Новый аккаунт'; $('issuer').value = a?.issuer ?? ''; $('account-name').value = a?.name ?? ''; $('secret').value = a?.secret ?? ''; $('algorithm').value = a?.algorithm ?? 'SHA1'; $('digits').value = a?.digits ?? 6; $('period').value = a?.period ?? 30; $('service').value = a?.binding?.service ?? 'none'; $('site-url').value = getStrategy(a?.binding?.service)?.customDomain ? a.binding.origin : ''; $('delete-button').hidden = !a; updateSite(); show('edit-dialog');
 }
-function updateSite() { const bitrix = $('service').value === 'bitrix'; $('site-label').hidden = !bitrix; $('site-url').required = bitrix; }
+function updateSite() {
+  const metadata = getStrategy($('service').value), custom = !!metadata?.customDomain; $('site-label').hidden = !custom; $('site-url').required = custom;
+  $('site-label').firstChild.textContent = metadata ? 'Адрес сайта · ' + metadata.displayName : 'Адрес сайта';
+  $('binding-info').textContent = $('service').value !== 'none' && !$('auto-toggle').checked
+    ? 'Включите автоподстановку в настройках. Привязка сохранится и при выключенном режиме.'
+    : 'Один аккаунт на сайт. Секретный ключ сайту не передаётся.';
+}
+function savedMessage(message, bound) { return bound && !$('auto-toggle').checked ? message + '. Включите автоподстановку в настройках.' : message; }
 $('service').addEventListener('change',updateSite);
 const shareButton = element('button','wide','QR для переноса на телефон'); shareButton.id = 'share-button'; shareButton.type = 'button'; $('edit-form').insertBefore(shareButton,$('edit-error'));
 shareButton.addEventListener('click',() => {
@@ -383,16 +429,16 @@ $('edit-form').addEventListener('submit',async e => {
     const next = editing ? accounts.map(old => old.id === editing ? a : old) : [...accounts,a]; validateBindings(next);
     if (!editing && accounts.some(old => fingerprint(old) === fingerprint(a))) throw new Error('Такой ключ с этими параметрами уже есть. Используйте редактирование или импорт с проверкой дубликатов.');
     // Permission request remains in the click/submit gesture, before crypto awaits.
-    if (a.binding && !(await chrome.permissions.request({origins:[a.binding.origin + '/*']}))) throw new Error('Доступ к сайту не предоставлен. Выберите «Не привязан» или разрешите доступ.');
+    if (a.binding && $('auto-toggle').checked && !(await chrome.permissions.request({origins:[a.binding.origin + '/*']}))) throw new Error('Доступ к сайту не предоставлен. Выберите «Не привязан» или разрешите доступ.');
     if (!key || generation !== token || editing !== editId || !$('edit-dialog').open) return;
     if (!editing) { resetImport(); pending = [{account:a,choice:'add',manual:true}]; hide('edit-dialog'); renderPreview(); show('import-dialog'); return; }
-    $('save-account').disabled = true; await persist(next); hide('edit-dialog'); toast('Аккаунт сохранён');
+    $('save-account').disabled = true; const result = await persist(next); hide('edit-dialog'); toast(committedMessage(savedMessage('Аккаунт сохранён',!!a.binding),result));
   } catch (error) { $('edit-error').textContent = error.message; } finally { $('save-account').disabled = false; }
 });
 function requestDelete(id) { const a = (reorderMode ? draftOrder : accounts).find(a => a.id === id); if (!a) return; deleteTarget = id; $('confirm-title').textContent = `Удалить «${title(a)}»?`; show('confirm-dialog'); }
 $('delete-button').addEventListener('click',() => requestDelete(editing));
 $('cancel-delete').addEventListener('click',() => { deleteTarget = null; hide('confirm-dialog'); });
-$('confirm-delete').addEventListener('click',async () => { const id = deleteTarget; if (!id) return; if (reorderMode) { draftOrder = draftOrder.filter(a => a.id !== id); deleteTarget = null; hide('confirm-dialog'); renderAccounts(); toast('Удаление применится после «Сохранить»'); return; } try { await persist(accounts.filter(a => a.id !== id)); deleteTarget = null; hide('confirm-dialog'); hide('edit-dialog'); toast('Аккаунт удалён'); } catch (e) { hide('confirm-dialog'); $('edit-error').textContent = e.message; } });
+$('confirm-delete').addEventListener('click',async () => { const id = deleteTarget; if (!id) return; if (reorderMode) { draftOrder = draftOrder.filter(a => a.id !== id); deleteTarget = null; hide('confirm-dialog'); renderAccounts(); toast('Удаление применится после «Сохранить»'); return; } try { const result = await persist(accounts.filter(a => a.id !== id)); deleteTarget = null; hide('confirm-dialog'); hide('edit-dialog'); toast(committedMessage('Аккаунт удалён',result)); } catch (e) { hide('confirm-dialog'); $('edit-error').textContent = e.message; } });
 const importSourceIds = {file:'file-import-dialog',text:'text-import-dialog',camera:'camera-dialog'};
 function sourceError() { return $('file-import-dialog').open ? $('file-import-error') : $('text-import-dialog').open ? $('text-import-error') : $('camera-dialog').open ? $('camera-error') : $('import-error'); }
 function openImport(source='file',preserve=false) {
@@ -535,7 +581,8 @@ $('commit-import').addEventListener('click',async () => {
       if (item.choice === 'replace' && conflict) next = next.map(old => old.id === conflict.id ? {...item.account,id:conflict.id,binding:old.binding} : old);
       else if (item.choice === 'add') next.push({...item.account,id:crypto.randomUUID(),binding:item.manual ? item.account.binding : null});
     }
-    await persist(next); resetImport(); hide('import-dialog'); toast('Импорт завершён');
+    const hasNewBinding = pending.some(item => item.manual && item.choice === 'add' && item.account.binding);
+    const result = await persist(next); resetImport(); hide('import-dialog'); toast(committedMessage(savedMessage('Импорт завершён',hasNewBinding),result));
   } catch (e) { $('import-error').textContent = e.message; renderPreview(); }
 });
 function stopCamera() { cameraGeneration++; cameraReader?.close(); cameraReader = null; clearTimeout(scanTimer); stream?.getTracks().forEach(t => t.stop()); stream = null; $('video').srcObject = null; scanBusy = false; scanCanvas.width = scanCanvas.height = 0; }
@@ -556,7 +603,7 @@ async function acceptCameraQR(values) {
   let accepted = false, duplicate = false;
   for (const value of values) {
     if (cameraSeen.has(value)) { duplicate = true; continue; }
-    try { ingest(value); cameraSeen.add(value); accepted = true; touch(); }
+    try { ingest(value); cameraSeen.add(value); accepted = true; }
     catch (e) { $('camera-error').textContent = e.message === 'Не найдены ссылки otpauth или данные резервной копии CHROME-APP-TOTP.' ? 'Этот QR не содержит ключ TOTP или экспорт Google Authenticator.' : e.message; }
   }
   renderPreview();
@@ -684,25 +731,21 @@ function moveDraft(id,targetId) { const from = draftOrder.findIndex(a => a.id ==
 function endOrder() { reorderMode = false; draftOrder = []; orderBar.hidden = true; $('search').disabled = false; $('search-toggle').disabled = false; $('menu-button').disabled = false; renderAccounts(); }
 orderButton.addEventListener('click',() => { if (!requireOpen()) return; hide('settings-dialog'); reorderMode = true; draftOrder = [...accounts]; closeSearch(); $('search').disabled = true; $('search-toggle').disabled = true; $('menu-button').disabled = true; orderBar.hidden = false; renderAccounts(); });
 cancelOrder.addEventListener('click',endOrder);
-saveOrder.addEventListener('click',async () => { saveOrder.disabled = true; try { await persist([...draftOrder]); endOrder(); toast('Порядок сохранён'); } catch (e) { toast(e.message); } finally { saveOrder.disabled = false; } });
-$('protection-toggle').addEventListener('change',async () => {
-  const target = !$('protection-toggle').checked;
-  $('protection-toggle').disabled = true;
+saveOrder.addEventListener('click',async () => { saveOrder.disabled = true; try { const result = await persist([...draftOrder]); endOrder(); toast(committedMessage('Порядок сохранён',result)); } catch (e) { toast(e.message); } finally { saveOrder.disabled = false; } });
+$('session-lifetime').addEventListener('change',async () => {
+  const select = $('session-lifetime'), seconds = Number(select.value);
+  select.disabled = true; $('settings-error').textContent = '';
   try {
-    if (!target && !requireOpen()) { $('protection-toggle').checked = !protectedMode; return; }
-    if (target) {
-      // Remove persistent raw material BEFORE publishing the protected setting.
-      await navigator.locks.request('chrome-app-totp-security',async () => { await chrome.storage.local.remove('deviceKey'); await chrome.storage.session.remove('uiUnlock'); await chrome.storage.local.set({protectedMode:true}); });
-      protectedMode = true; $('passkey-setting').hidden = false; $('passkey-toggle').disabled = false; await lock(); toast('Ключ устройства удалён. Защита включена.');
-    } else {
-      const epoch = await lockEpoch();
-      protectedMode = false; $('passkey-setting').hidden = true; await chrome.storage.local.set({protectedMode:false});
-      try { await rememberKey(key,salt,false,epoch); }
-      catch (error) { await navigator.locks.request('chrome-app-totp-security',async()=>{await chrome.storage.local.remove('deviceKey'); await chrome.storage.local.set({protectedMode:true});}); protectedMode = true; $('passkey-setting').hidden = false; throw error; }
-      await chrome.storage.local.remove('passkeyConfig'); passkeyConfig = null; $('passkey-toggle').checked = false; $('passkey-toggle').disabled = true; toast('Автоматическое открытие включено');
-    }
-  } catch (e) { $('protection-toggle').checked = !protectedMode; $('settings-error').textContent = e.message; }
-  finally { $('protection-toggle').disabled = false; }
+    if (!requireOpen()) return;
+    await changeSessionLifetime(key,salt,seconds,sessionDocumentId);
+    protectedMode = seconds !== 0;
+    $('passkey-setting').hidden = !protectedMode; $('passkey-toggle').disabled = !protectedMode;
+    if (!protectedMode) { passkeyConfig = null; $('passkey-toggle').checked = false; }
+    updateOldPasswordField(); toast('Время жизни сессии сохранено');
+  } catch (e) {
+    select.value = String(sessionLifetime(await chrome.storage.local.get(['sessionLifetime','protectedMode'])));
+    $('settings-error').textContent = e.message;
+  } finally { select.disabled = false; }
 });
 $('passkey-toggle').addEventListener('change',async () => {
   if (!$('passkey-toggle').checked) { await chrome.storage.local.remove('passkeyConfig'); passkeyConfig = null; $('unlock-passkey').hidden = true; return; }
@@ -727,12 +770,26 @@ $('unlock-passkey').addEventListener('click',() => { void usePasskey(); });
 $('theme').addEventListener('change',async () => { document.documentElement.dataset.theme = $('theme').value; await chrome.storage.local.set({theme:$('theme').value}); });
 $('layout').addEventListener('change',async () => { document.documentElement.dataset.layout = $('layout').value; await chrome.storage.local.set({layout:$('layout').value}); });
 $('auto-toggle').addEventListener('change',async () => {
-  try { await chrome.storage.local.set({autoEnabled:$('auto-toggle').checked}); await activateAuto(); if ($('auto-toggle').checked && !autoExpires) toast('Привяжите сервис через шестерёнку аккаунта.'); }
+  const enabled = $('auto-toggle').checked;
+  try {
+    // Request only the saved sites, while the toggle's user gesture is active.
+    const origins = [...new Set(accounts.filter(a => a.binding).map(a => a.binding.origin + '/*'))];
+    if (enabled && origins.length && !(await chrome.permissions.request({origins}))) {
+      $('auto-toggle').checked = false; updateAutoLabel();
+      toast('Для автоподстановки разрешите доступ к выбранным сайтам. Привязки сохранены.'); return;
+    }
+    await chrome.storage.local.set({autoEnabled:enabled}); await activateAuto(); if (enabled && !autoExpires) toast('Привяжите сервис через шестерёнку аккаунта.');
+  }
   catch (e) { toast(e.message); }
 });
 $('revoke-sites').addEventListener('click',async () => { await chrome.storage.local.set({autoEnabled:false}); $('auto-toggle').checked = false; await activateAuto(); const permissions = await chrome.permissions.getAll(); if (permissions.origins?.length) await chrome.permissions.remove({origins:permissions.origins}); toast('Доступ к сайтам отключён'); });
 let passwordChangeBusy = false, passwordDialogGeneration = 0;
-function updateOldPasswordField() { $('old-password-label').hidden = protectedMode; $('old-password').required = !protectedMode; }
+async function updateOldPasswordField() {
+  const [{protectedMode:protectedSetting},{uiUnlock}] = await Promise.all([chrome.storage.local.get('protectedMode'),chrome.storage.session.get('uiUnlock')]);
+  const required = protectedSetting === false || uiUnlock?.requiresOldPassword === true;
+  $('old-password-label').hidden = !required; $('old-password').required = required;
+  return required;
+}
 function updateNewPasswordLength() {
   const length = Number($('new-password-length').value);
   for (const id of ['new-password','new-password-confirm']) { $(id).value = ''; $(id).minLength = length; $(id).maxLength = length*2; }
@@ -746,10 +803,11 @@ $('change-password-form').addEventListener('submit',async e => {
   const submit = $('change-password-form').querySelector('button.primary');
   const newPassword = $('new-password').value, oldPassword = $('old-password').value;
   passwordChangeBusy = true; submit.disabled = true; $('password-error').textContent = '';
+  let savedPasswordResult = null;
   try {
     if (Array.from(newPassword).length !== Number($('new-password-length').value)) throw new Error('Введите ровно '+$('new-password-length').value+' символа.');
     if (newPassword !== $('new-password-confirm').value) throw new Error('Пароли не совпадают.');
-    const mustVerify = (await chrome.storage.local.get('protectedMode')).protectedMode === false;
+    const mustVerify = await updateOldPasswordField();
     if (mustVerify) {
       if (!oldPassword) throw new Error('Введите текущий мастер-пароль.');
       const current = await loadVault();
@@ -759,12 +817,15 @@ $('change-password-form').addEventListener('submit',async e => {
     }
     const next = await createKey(newPassword);
     if (token !== generation || !key || dialogToken !== passwordDialogGeneration) return;
-    if (!mustVerify && (await chrome.storage.local.get('protectedMode')).protectedMode === false) throw new Error('Режим изменился. Введите текущий мастер-пароль и повторите смену.');
+    if (!mustVerify && await updateOldPasswordField()) throw new Error('Режим изменился. Введите текущий мастер-пароль и повторите смену.');
     if (token !== generation || !key || dialogToken !== passwordDialogGeneration) return;
-    await persist(accounts,next.key,next.salt,next.passwordLength);
-    await chrome.storage.local.remove('passkeyConfig'); passkeyConfig = null; $('passkey-toggle').checked = false;
-    $('change-password-form').reset(); hide('password-dialog'); toast('JSON перешифрован. Ключ доступа нужно привязать заново.');
-  } catch (error) { if (dialogToken === passwordDialogGeneration) $('password-error').textContent = error.message; }
+    const result = savedPasswordResult = await persist(accounts,next.key,next.salt,next.passwordLength);
+    await chrome.storage.local.remove('passkeyConfig'); passkeyConfig = null; $('passkey-toggle').checked = false; $('unlock-passkey').hidden = true;
+    $('change-password-form').reset(); hide('password-dialog'); toast(result.locked ? 'Пароль изменён. Сессия завершена. Войдите с новым паролем.' : 'JSON перешифрован. Ключ доступа нужно привязать заново.');
+  } catch (error) {
+    if (savedPasswordResult?.committed) { hide('password-dialog'); toast('Пароль изменён. Откройте приложение заново и войдите с новым паролем.'); }
+    else if (dialogToken === passwordDialogGeneration) $('password-error').textContent = error.message;
+  }
   finally { passwordChangeBusy = false; submit.disabled = false; }
 });
 for (const button of document.querySelectorAll('.close')) button.addEventListener('click',() => { const dialog=button.closest('dialog'); if(dialog.id==='camera-dialog')stopCamera(); if(dialog.id==='export-qr-dialog')clearExportQR(); dialog.close(); });
@@ -812,7 +873,6 @@ $('search').addEventListener('input',renderAccounts); $('lock-button').addEventL
 function closeSearch() { $('search-panel').hidden = true; $('search').value = ''; $('search-toggle').setAttribute('aria-expanded','false'); renderAccounts(); }
 $('search-toggle').addEventListener('click',() => { if (!key || reorderMode) return; if (!$('search-panel').hidden) closeSearch(); else { $('search-panel').hidden = false; $('search-toggle').setAttribute('aria-expanded','true'); $('search').focus(); } });
 $('search').addEventListener('keydown',e => { if (e.key === 'Escape') { e.preventDefault(); closeSearch(); $('search-toggle').focus(); } });
-for (const name of ['pointerdown','keydown','input']) document.addEventListener(name,touch,{passive:true});
 document.addEventListener('visibilitychange',() => {
   clearTimeout(tickTimer);
   clearTimeout(pinGateTimer);
@@ -820,22 +880,24 @@ document.addEventListener('visibilitychange',() => {
   if (document.hidden) { const scanning = ['live','processing'].includes(cameraMode); stopCamera(); if ($('camera-dialog').open && scanning) { cameraStage('paused'); $('camera-status').textContent = 'Камера приостановлена, пока окно скрыто.'; } }
   else { void tick(); if ($('camera-dialog').open && key && cameraMode === 'paused') void startCamera($('camera-select').value); }
 });
-window.addEventListener('pagehide',() => { generation++; key = null; accounts = []; clearExportQR(); codeCache.clear(); clearTimeout(tickTimer); clearTimeout(idleTimer); stopCamera(); });
+window.addEventListener('pagehide',() => { generation++; key = null; accounts = []; clearExportQR(); codeCache.clear(); clearTimeout(tickTimer); clearTimeout(expiryTimer); void chrome.runtime.sendMessage({type:'session-view-closing'}).catch(() => {}); try { sessionPort?.postMessage({closing:true}); sessionPort?.disconnect(); } catch {} stopCamera(); });
 chrome.storage.onChanged.addListener((changes,area) => {
   if (area === 'local' && changes.passwordAttemptGate && !key) void refreshPinGate();
   if (area === 'local' && changes.vaultMeta && key && !writing && changes.vaultMeta.newValue?.token !== vaultToken(vault)) { lockLocal(); void configureLock(); toast('Файл изменился в другом окне. Откройте его снова.'); }
   if (area === 'local' && changes.vaultFileChanged) { if (key) { lockLocal(); void chrome.runtime.sendMessage({type:'lock'}); } void configureLock(); }
   if (area === 'local' && changes.autoEnabled) { $('auto-toggle').checked = changes.autoEnabled.newValue === true; updateAutoLabel(); }
   if (area === 'local' && changes.layout) { const layout = changes.layout.newValue === 'tiles' ? 'tiles' : 'rows'; $('layout').value = layout; document.documentElement.dataset.layout = layout; }
-  if (area === 'local' && changes.protectedMode) { protectedMode = changes.protectedMode.newValue !== false; $('protection-toggle').checked = !protectedMode; $('passkey-toggle').disabled = !protectedMode; $('passkey-setting').hidden = !protectedMode; updateOldPasswordField(); }
+  if (area === 'local' && changes.protectedMode) { protectedMode = changes.protectedMode.newValue !== false; $('passkey-toggle').disabled = !protectedMode; $('passkey-setting').hidden = !protectedMode; updateOldPasswordField(); }
+  if (area === 'local' && changes.sessionLifetime) $('session-lifetime').value = String(changes.sessionLifetime.newValue);
+  if (area === 'session' && changes.uiUnlock) void watchSessionDeadline();
   if (area === 'session' && changes.autofillSession) { autoExpires = changes.autofillSession.newValue?.expires ?? 0; updateAutoLabel(); }
   if (area === 'session' && changes.lockEpoch && !localLockRequest) { lockLocal(); void configureLock(); }
 });
 async function init() {
-  const prefs = await chrome.storage.local.get(['theme','layout','autoEnabled','protectedMode']); $('theme').value = ['light','dark'].includes(prefs.theme) ? prefs.theme : 'auto'; document.documentElement.dataset.theme = $('theme').value; $('layout').value = prefs.layout === 'tiles' ? 'tiles' : 'rows'; document.documentElement.dataset.layout = $('layout').value; $('auto-toggle').checked = prefs.autoEnabled === true; $('auto-toggle').disabled = false;
-  protectedMode = prefs.protectedMode !== false; $('protection-toggle').checked = !protectedMode; $('passkey-toggle').disabled = !protectedMode;
+  const prefs = await chrome.storage.local.get(['theme','layout','autoEnabled','protectedMode','sessionLifetime']); $('theme').value = ['light','dark'].includes(prefs.theme) ? prefs.theme : 'auto'; document.documentElement.dataset.theme = $('theme').value; $('layout').value = prefs.layout === 'tiles' ? 'tiles' : 'rows'; document.documentElement.dataset.layout = $('layout').value; $('auto-toggle').checked = prefs.autoEnabled === true; $('auto-toggle').disabled = false;
+  protectedMode = sessionLifetime(prefs) !== 0; $('session-lifetime').value = String(sessionLifetime(prefs)); $('passkey-toggle').disabled = !protectedMode;
   const status = await chrome.runtime.sendMessage({type:'status'}); autoExpires = status?.expires ?? 0; updateAutoLabel(); await configureLock();
-  if (vault && !$('unlock-form').hidden) { const authEpoch = await lockEpoch(); const remembered = await recallKey(vault,protectedMode); if (remembered) await acceptUnlocked(remembered,vault,authEpoch); }
+  if (vault && !$('unlock-form').hidden) { const authEpoch = await lockEpoch(); const remembered = await recallKey(vault,protectedMode); if (remembered) await acceptUnlocked(remembered,vault,authEpoch,false); }
   if (authOnly && !key && passkeyConfig && protectedMode && vault && !$('unlock-form').hidden) await usePasskey();
   const params = new URLSearchParams(location.search);
   if (params.has('settings')) { history.replaceState(null,'','app.html?full=1'); openSettings(); }

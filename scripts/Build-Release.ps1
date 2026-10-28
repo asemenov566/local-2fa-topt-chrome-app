@@ -16,6 +16,7 @@ $releaseFiles = @(
     'extension/qr-reader.js'
     'extension/qr.js'
     'extension/security.js'
+    'extension/session.js'
     'extension/THIRD_PARTY_NOTICES.txt'
     'extension/timer.js'
     'extension/vault.js'
@@ -95,6 +96,21 @@ try {
     Assert-NoReparsePoint $projectRoot
     $outputRoot = Join-Path $projectRoot 'outputs'
     Assert-NoReparsePoint $outputRoot
+
+    # This explicit list is generated from validated site strategy classes.
+    # It does not include arbitrary files from the strategy/generated folders.
+    $strategyListPath = Join-Path $projectRoot 'scripts/strategy-files.json'
+    Assert-NoReparsePoint $strategyListPath
+    $strategyList = Get-Content -LiteralPath $strategyListPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($strategyList.version -ne 1 -or @($strategyList.files).Count -lt 3) {
+        throw 'Generate the site strategy file list before building the release.'
+    }
+    foreach ($strategyFile in $strategyList.files) {
+        if ($strategyFile -notmatch '^extension/(strategy|generated)/[a-z][a-z0-9-]*\.js$' -or $strategyFile -cin $releaseFiles) {
+            throw 'The strategy release file list is invalid.'
+        }
+        $releaseFiles += $strategyFile
+    }
 
     foreach ($relativePath in $releaseFiles) {
         $sourcePath = Join-Path $projectRoot $relativePath

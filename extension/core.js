@@ -1,3 +1,4 @@
+import {getStrategy} from './strategy/registry.js';
 // All OTP and import operations are local. No network or logging of user data.
 const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 export function encode32(bytes) {
@@ -46,11 +47,12 @@ export function normalizeAccount(a) {
 }
 export function normalizeBinding(binding) {
   if (!binding || binding.service === 'none') return null;
-  if (binding.service === 'gosuslugi') return {service:'gosuslugi',origin:'https://esia.gosuslugi.ru'};
-  if (binding.service !== 'bitrix') throw new Error('Неизвестный сервис автоподстановки.');
-  let u; try { u = new URL(binding.origin); } catch { throw new Error('Введите полный HTTPS-адрес Битрикс.'); }
+  const Strategy = getStrategy(binding.service);
+  if (!Strategy) throw new Error('Неизвестный сервис автоподстановки.');
+  if (!Strategy.customDomain) return {service:Strategy.id,origin:Strategy.domain};
+  let u; try { u = new URL(binding.origin); } catch { throw new Error('Введите полный HTTPS-адрес сайта.'); }
   if (u.protocol !== 'https:' || u.username || u.password || u.port || !u.hostname.includes('.') || u.hostname.includes('*')) throw new Error('Нужен HTTPS-адрес без логина, пароля и нестандартного порта.');
-  return {service:'bitrix',origin:u.origin};
+  return {service:Strategy.id,origin:u.origin};
 }
 export function validateBindings(accounts) {
   const seen = new Set();

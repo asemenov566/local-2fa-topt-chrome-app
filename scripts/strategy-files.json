@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "files": [
+    "extension/strategy/registry.js",
+    "extension/strategy/bitrix.js",
+    "extension/strategy/gosuslugi.js",
+    "extension/strategy/openai.js",
+    "extension/generated/bitrix.js",
+    "extension/generated/gosuslugi.js",
+    "extension/generated/openai.js"
+  ]
+}

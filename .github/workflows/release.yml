@@ -50,6 +50,8 @@ jobs:
           }
           "version=$version" >> $env:GITHUB_OUTPUT
       - run: npm ci
+      - run: npm run check:strategies
+      - run: npm run build:strategies
       - name: Prepare isolated test directories
         run: New-Item -ItemType Directory -Force -Path work, outputs | Out-Null
       - run: npm test

@@ -44,7 +44,7 @@ const {chromium} = require('./test-browser.cjs');
       assert.equal(await page.locator('#pin-dots .pin-dot').count(),4);
       assert.equal(await page.locator('#pin-length').isVisible(),true);
       assert.equal(await page.locator('#unlock-passkey').isVisible(),false);
-      assert.equal(await page.locator('#protection-toggle').isChecked(),false);
+      assert.equal(await page.locator('#session-lifetime').inputValue(),'60');
       assert.equal(await page.locator('#passkey-toggle').isChecked(),false);
       const clean = await page.evaluate(async () => {
         const local = await chrome.storage.local.get(null), session = await chrome.storage.session.get(null);
@@ -130,7 +130,7 @@ const {chromium} = require('./test-browser.cjs');
     await control.goto(base + 'app.html?fixture=existing');
     const preserved = await control.evaluate(async () => {
       await chrome.storage.local.set({protectedMode:false,autoEnabled:false,deviceKey:{fixture:true},passkeyConfig:{fixture:true},vaultMeta:{fixture:true},theme:'dark',layout:'tiles'});
-      await chrome.storage.session.set({uiUnlock:{fixture:true},importWindowDrafts:{fixture:true}});
+      await chrome.storage.session.set({uiUnlock:{fixture:true,authenticatedAt:Date.now(),expiresAt:0},importWindowDrafts:{fixture:true}});
       await chrome.runtime.sendMessage({type:'status'});
       const before = {local:await chrome.storage.local.get(null),session:await chrome.storage.session.get(null)};
       const reply = await chrome.runtime.sendMessage({type:'prepare-new-vault'});

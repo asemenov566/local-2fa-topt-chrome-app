@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createKey,seal,exportKey} from '../extension/vault.js';
-import {rememberKey,recallKey,prepareRememberKey} from '../extension/security.js';
+import {rememberKey,recallKey,prepareRememberKey,changeSessionLifetime} from '../extension/security.js';
+import {sessionAlive,sessionLifetime,reconcileSessionPolicy} from '../extension/session.js';
 
 let local,session,wrapped,queue=Promise.resolve(),failNative=false,calls,interceptNative;
 function storage(which) {return {
@@ -88,4 +89,21 @@ test('failed stale unwrap does not erase a newly stored wrapper; preflight avoid
  failNative=true;await rememberKey(created.key,created.salt,false,0,token);
  assert.equal(calls.length,count,'Prepared commit must not invoke DPAPI again after the file write');
  await assert.rejects(rememberKey(created.key,created.salt,false,0,token),/отменена/);
+});
+
+test('session lifetime defaults to one minute, preserves deadline on save and rejects expired keys',async()=>{
+ reset();local={protectedMode:true};const created=await createKey('1234'),v=await seal([],created.key,created.salt,1,4);
+ assert.equal(sessionLifetime({}),60);assert.equal(sessionLifetime({sessionLifetime:30}),30);assert.equal(sessionLifetime({protectedMode:false}),0);
+ await rememberKey(created.key,created.salt,true);const start=session.uiUnlock.authenticatedAt,deadline=session.uiUnlock.expiresAt;
+ assert.equal(deadline-start,60000);assert.equal(sessionAlive(session.uiUnlock),true);
+ await rememberKey(created.key,created.salt,true);assert.equal(session.uiUnlock.authenticatedAt,start);assert.equal(session.uiUnlock.expiresAt,deadline);
+ session.uiUnlock.expiresAt=Date.now()-1;assert.equal(await recallKey(v,true),null);await assert.rejects(prepareRememberKey(created.key,created.salt,0),/отменена/);
+ await rememberKey(created.key,created.salt,true,0,undefined,{freshAuthentication:true});assert.ok(session.uiUnlock.expiresAt>Date.now());
+});
+test('session mode choice persists immediately, wraps/removes device key and changes deadline on close',async()=>{
+ reset();local={protectedMode:true};const created=await createKey('1234');await rememberKey(created.key,created.salt,true);const original={...session.uiUnlock};
+ await changeSessionLifetime(created.key,created.salt,0,'synthetic-document');assert.equal(local.sessionLifetime,0);assert.equal(local.deviceKey.protection,'windows-dpapi');assert.equal(session.uiUnlock.expiresAt,original.expiresAt);
+ await reconcileSessionPolicy('synthetic-document');assert.equal(session.uiUnlock.expiresAt,0);assert.equal(session.uiUnlock.authenticatedAt,original.authenticatedAt);
+ await changeSessionLifetime(created.key,created.salt,30,'synthetic-document');assert.equal(local.deviceKey,undefined);assert.equal(session.uiUnlock.expiresAt,0);
+ await reconcileSessionPolicy('synthetic-document');assert.equal(session.uiUnlock.expiresAt,original.authenticatedAt+30000);assert.equal(session.pendingSessionPolicy,undefined);
 });

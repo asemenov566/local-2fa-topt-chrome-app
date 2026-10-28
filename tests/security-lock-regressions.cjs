@@ -53,11 +53,11 @@ async function delayedProtectLock(){
   await nativeMock(context,async request=>{if(request.op==='protect-key'){entered.resolve();await release.promise;return {ok:true,wrapped:randomBytes(48).toString('base64')};}return {ok:false,error:'Unexpected synthetic native operation'};});
   const {base}=await address(context),first=await context.newPage();await seed(first,base);
   const second=await context.newPage();await second.goto(base+'app.html?full=1');await second.locator('.code').waitFor({state:'visible'});
-  await first.locator('#settings-button').click();await first.locator('#protection-toggle').check();await bounded(entered.promise,'DPAPI protect request was not reached');
+  await first.locator('#settings-button').click();await first.locator('#session-lifetime').selectOption('0');await bounded(entered.promise,'DPAPI protect request was not reached');
   await first.locator('#settings-dialog .close').click();await first.locator('#lock-button').click();
   await second.locator('#codes-screen').waitFor({state:'hidden',timeout:1500});
   assert.deepEqual(await second.evaluate(async()=>{const s=await chrome.storage.session.get(['manualLock','uiUnlock']);return {locked:s.manualLock===true,noKey:!s.uiUnlock,noCode:!document.querySelector('.code')};}),{locked:true,noKey:true,noCode:true});
-  release.resolve();await first.waitForFunction(()=>!document.querySelector('#protection-toggle').disabled);
+  release.resolve();await first.waitForFunction(()=>!document.querySelector('#session-lifetime').disabled);
   assert.equal(await second.evaluate(async()=>!(await chrome.storage.session.get('uiUnlock')).uiUnlock),true);
   console.log('PASS delayed DPAPI response does not delay locking the other window or restore its unlocked session');
  }finally{release.resolve();await context.close();}
@@ -71,7 +71,7 @@ async function delayedOtpReadLock(){
   const info=await address(context);worker=info.worker;const {base}=info,first=await context.newPage();
   await seed(first,base,{binding:{service:'bitrix',origin:'https://security-regression.example.test'},file:'SYNTHETIC-IO.vault'});
   const second=await context.newPage();await second.goto(base+'app.html?full=1');await second.locator('.code').waitFor({state:'visible'});
-  await context.route('https://security-regression.example.test/**',route=>route.fulfill({contentType:'text/html',body:'<!doctype html><meta charset="utf-8"><button id="login">Войти</button><div id="otp"></div><script>document.getElementById("login").onclick=()=>document.getElementById("otp").innerHTML="<input name=USER_OTP>";</script>'}));
+  await context.route('https://security-regression.example.test/**',route=>route.fulfill({contentType:'text/html',body:'<!doctype html><meta charset="utf-8"><form name="form_auth"><input name="USER_LOGIN"><button type="button" id="login">Войти</button><div id="otp"></div></form><script>document.getElementById("login").onclick=()=>document.getElementById("otp").innerHTML="<input name=USER_OTP>";</script>'}));
   const site=await context.newPage();await site.goto('https://security-regression.example.test/login/');
   await worker.evaluate(()=>{
    const original=FileSystemFileHandle.prototype.getFile;let entered;
@@ -90,4 +90,44 @@ async function delayedOtpReadLock(){
   console.log('PASS delayed OTP file read cannot postpone lock or insert a code after locking');
  }finally{try{await worker?.evaluate(()=>globalThis.testReleaseRead?.());}catch{}await context.close();}
 }
-(async()=>{await failedPasswordChange();await delayedProtectLock();await delayedOtpReadLock();})().catch(error=>{console.error(error);process.exitCode=1;});
+async function passwordCommittedAtExpiry(){
+ const context=await launch();
+ try {
+  const {worker,base}=await address(context),page=await context.newPage();await seed(page,base,{file:'SYNTHETIC-COMMIT.vault'});
+  // Isolate the commit/rememberKey race from the independent alarm and UI timeout.
+  await worker.evaluate(async()=>{chrome.alarms.create=async()=>{};await chrome.alarms.clear('totp-session-expiry');});
+  await page.locator('#settings-button').click();await page.locator('#change-password-open').click();await page.locator('#new-password-length').selectOption('4');
+  await page.locator('#new-password').fill('4321');await page.locator('#new-password-confirm').fill('4321');
+  await page.evaluate(async()=>{
+   const send=chrome.runtime.sendMessage.bind(chrome.runtime);chrome.runtime.sendMessage=m=>m?.type==='session-expire'?new Promise(()=>{}):send(m);
+   const close=FileSystemWritableFileStream.prototype.close;FileSystemWritableFileStream.prototype.close=async function(...args){await close.apply(this,args);await new Promise(resolve=>setTimeout(resolve,1200));};
+   const {uiUnlock}=await chrome.storage.session.get('uiUnlock');await chrome.storage.session.set({uiUnlock:{...uiUnlock,expiresAt:Date.now()+1000}});
+  });
+  await page.locator('#change-password-form button.primary').click();await page.waitForFunction(()=>document.querySelector('#toast').textContent.includes('Пароль изменён. Сессия завершена.'));
+  const result=await page.evaluate(async()=>{
+   const v=await import('./vault.js'),file=await v.loadVault(),session=await chrome.storage.session.get(['uiUnlock','manualLock']);let oldOpens=false,newOpens=false;
+   try{await v.unseal(file,'1234');oldOpens=true;}catch{}try{await v.unseal(file,'4321');newOpens=true;}catch{}
+   return {oldOpens,newOpens,locked:session.manualLock===true,noKey:!session.uiUnlock,dialogOpen:document.querySelector('#password-dialog').open,error:document.querySelector('#password-error').textContent};
+  });
+  assert.deepEqual(result,{oldOpens:false,newOpens:true,locked:true,noKey:true,dialogOpen:false,error:''});
+  console.log('PASS password committed at expiry is reported saved and locked, with new password active and no revived key');
+ } finally {await context.close();}
+}
+async function stalePasswordCommitPreservesFreshLogin(){
+ const context=await launch(),entered=deferred(),release=deferred();
+ try {
+  const {base}=await address(context),first=await context.newPage();await seed(first,base,{file:'SYNTHETIC-NEW-LOGIN.vault'});
+  await context.exposeFunction('__testAfterDiskCommit',()=>{entered.resolve();return release.promise;});
+  await first.evaluate(()=>{const close=FileSystemWritableFileStream.prototype.close;FileSystemWritableFileStream.prototype.close=async function(...args){await close.apply(this,args);await globalThis.__testAfterDiskCommit();};});
+  await first.locator('#settings-button').click();await first.locator('#change-password-open').click();await first.locator('#new-password-length').selectOption('4');
+  await first.locator('#new-password').fill('5678');await first.locator('#new-password-confirm').fill('5678');await first.locator('#change-password-form button.primary').click();
+  await bounded(entered.promise,'Password file commit was not reached');
+  const second=await context.newPage();await second.goto(base+'app.html?full=1');await second.locator('#password').fill('5678');await second.locator('#codes-screen').waitFor({state:'visible'});
+  const fresh=await second.evaluate(async()=>{const {uiUnlock,lockEpoch}=await chrome.storage.session.get(['uiUnlock','lockEpoch']);return {authenticatedAt:uiUnlock.authenticatedAt,salt:uiUnlock.salt,lockEpoch};});
+  release.resolve();await first.waitForFunction(()=>document.querySelector('#toast').textContent.includes('Пароль изменён. Сессия завершена.'));
+  const after=await second.evaluate(async()=>{const {uiUnlock,lockEpoch}=await chrome.storage.session.get(['uiUnlock','lockEpoch']);return {authenticatedAt:uiUnlock?.authenticatedAt,salt:uiUnlock?.salt,lockEpoch};});
+  assert.deepEqual(after,fresh);assert.equal(await second.locator('#codes-screen').isVisible(),true);assert.equal(await first.locator('#codes-screen').isVisible(),false);
+  console.log('PASS late completion of old password save never locks a fresh login in another window');
+ } finally {release.resolve();await context.close();}
+}
+(async()=>{await failedPasswordChange();await delayedProtectLock();await delayedOtpReadLock();await passwordCommittedAtExpiry();await stalePasswordCommitPreservesFreshLogin();})().catch(error=>{console.error(error);process.exitCode=1;});
