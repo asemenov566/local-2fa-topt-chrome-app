@@ -327,7 +327,7 @@ $('unlock-form').addEventListener('submit',async e => {
   const password = $('password').value, length = pinLength();
   if (!password || (length && Array.from(password).length!==length)) return;
   if (!vault && !pinDraft) { pinDraft = password; $('password').value = ''; $('password-confirm').value = ''; $('unlock-error').textContent = ''; renderPinDots(); renderPinGate(); focusPin(); return; }
-  if (!vault && password !== pinDraft) { pinDraft = ''; rejectPin(new Error('Пароли не совпадают.')); renderPinGate(); focusPin(); return; }
+  if (!vault && password.toUpperCase() !== pinDraft.toUpperCase()) { pinDraft = ''; rejectPin(new Error('Пароли не совпадают.')); renderPinGate(); focusPin(); return; }
   unlockBusy = true; renderPinGate(); $('unlock-error').textContent = ''; $('unlock-button').disabled = true;
   const token = generation;
   const expectedVault = vaultToken(vault);
@@ -784,6 +784,62 @@ $('auto-toggle').addEventListener('change',async () => {
 });
 $('revoke-sites').addEventListener('click',async () => { await chrome.storage.local.set({autoEnabled:false}); $('auto-toggle').checked = false; await activateAuto(); const permissions = await chrome.permissions.getAll(); if (permissions.origins?.length) await chrome.permissions.remove({origins:permissions.origins}); toast('Доступ к сайтам отключён'); });
 let passwordChangeBusy = false, passwordDialogGeneration = 0;
+let passwordStage = 'new', passwordStageBusy = false, passwordBlockedUntil = 0, passwordStageTimer;
+const changeInputIds = {old:'old-password',new:'new-password',confirm:'new-password-confirm'};
+function focusChangePin() {
+  if (!$('password-dialog').open || passwordChangeBusy || passwordStageBusy) return;
+  const input = $(changeInputIds[passwordStage]);
+  if (input.disabled) return;
+  input.focus({preventScroll:true}); input.setSelectionRange(input.value.length,input.value.length);
+}
+function renderChangePin() {
+  clearTimeout(passwordStageTimer);
+  if (!$('password-dialog').open) return;
+  const remaining = Math.max(0,Math.ceil((passwordBlockedUntil-Date.now())/1000));
+  const length = passwordStage === 'old' ? vault.passwordLength : Number($('new-password-length').value);
+  const active = changeInputIds[passwordStage], count = Array.from($(active).value).length;
+  $('change-password-form').dataset.stage = passwordStage;
+  $('change-pin-dots').replaceChildren(...Array.from({length},(_,i)=>element('span','pin-dot'+(i<count?' filled':''))));
+  for (const id of Object.values(changeInputIds)) $(id).disabled = id !== active || passwordChangeBusy || passwordStageBusy || (passwordStage === 'old' && remaining>0);
+  $('new-password-length').disabled = passwordChangeBusy || passwordStageBusy;
+  $('change-pin-prompt').textContent = passwordChangeBusy || passwordStageBusy ? 'Проверяем…' : passwordStage === 'old' && remaining ? 'Повторите через '+Math.floor(remaining/60)+':'+String(remaining%60).padStart(2,'0') : {old:'Введите текущий пароль',new:'Задайте новый пароль',confirm:'Повторите новый пароль'}[passwordStage];
+  if (passwordStage === 'old' && remaining) passwordStageTimer = setTimeout(()=>{renderChangePin();focusChangePin();},Math.min(1000,passwordBlockedUntil-Date.now()));
+}
+function rejectChangePin(error,stage = 'new') {
+  passwordStage = stage;
+  for (const id of Object.values(changeInputIds)) if (stage === 'old' || id !== 'old-password') $(id).value = '';
+  $('password-error').textContent = error.message;
+  if (error.blockedUntil) passwordBlockedUntil = error.blockedUntil;
+  $('change-pin-dots').classList.remove('shake'); void $('change-pin-dots').offsetWidth; $('change-pin-dots').classList.add('shake');
+  renderChangePin(); focusChangePin();
+}
+async function changePinInput(event) {
+  if (passwordChangeBusy || passwordStageBusy || !$('password-dialog').open) return;
+  const input = $(changeInputIds[passwordStage]), length = passwordStage === 'old' ? vault.passwordLength : Number($('new-password-length').value);
+  if (event.target !== input || input.disabled) return;
+  const chars = Array.from(input.value); if (chars.length>length) input.value = chars.slice(0,length).join('');
+  renderChangePin();
+  if (event.isComposing || Array.from(input.value).length !== length) return;
+  $('password-error').textContent = '';
+  if (passwordStage === 'new') { passwordStage = 'confirm'; $('new-password-confirm').value = ''; renderChangePin(); focusChangePin(); return; }
+  if (passwordStage === 'confirm') {
+    if ($('new-password').value.toUpperCase() !== input.value.toUpperCase()) { rejectChangePin(new Error('Пароли не совпадают.')); return; }
+    $('change-password-form').requestSubmit(); return;
+  }
+  const dialogToken = passwordDialogGeneration, token = generation;
+  passwordStageBusy = true; renderChangePin();
+  try {
+    const current = await loadVault();
+    if (!current || vaultToken(current) !== vaultToken(vault)) throw new Error('База изменилась. Откройте её заново.');
+    await attemptPassword(current,input.value);
+    if (dialogToken !== passwordDialogGeneration || token !== generation || !key) return;
+    passwordBlockedUntil = 0; passwordStage = 'new';
+  } catch (error) { if (dialogToken === passwordDialogGeneration && token === generation) rejectChangePin(error,'old'); }
+  finally { if (dialogToken === passwordDialogGeneration) { passwordStageBusy = false; renderChangePin(); focusChangePin(); } }
+}
+for (const id of Object.values(changeInputIds)) { $(id).addEventListener('input',changePinInput); $(id).addEventListener('compositionend',changePinInput); }
+$('password-dialog').addEventListener('click',event=>{if(!event.target.closest('select,button,a'))focusChangePin();});
+$('change-pin-dots').addEventListener('animationend',()=>$('change-pin-dots').classList.remove('shake'));
 async function updateOldPasswordField() {
   const [{protectedMode:protectedSetting},{uiUnlock}] = await Promise.all([chrome.storage.local.get('protectedMode'),chrome.storage.session.get('uiUnlock')]);
   const required = protectedSetting === false || uiUnlock?.requiresOldPassword === true;
@@ -791,22 +847,34 @@ async function updateOldPasswordField() {
   return required;
 }
 function updateNewPasswordLength() {
-  const length = Number($('new-password-length').value);
-  for (const id of ['new-password','new-password-confirm']) { $(id).value = ''; $(id).minLength = length; $(id).maxLength = length*2; }
+  for (const id of ['new-password','new-password-confirm']) $(id).value = '';
+  if (passwordStage !== 'old') passwordStage = 'new';
+  $('password-error').textContent = ''; renderChangePin(); focusChangePin();
 }
 $('new-password-length').addEventListener('change',updateNewPasswordLength);
-$('change-password-open').addEventListener('click',() => { if (requireOpen()) { $('change-password-form').reset(); updateNewPasswordLength(); updateOldPasswordField(); $('password-error').textContent = ''; show('password-dialog'); } });
-$('password-dialog').addEventListener('close',() => { passwordDialogGeneration++; $('change-password-form').reset(); });
+$('change-password-open').addEventListener('click',async () => {
+  if (!requireOpen()) return;
+  const dialogToken = ++passwordDialogGeneration;
+  $('change-password-form').reset(); passwordStageBusy = true; passwordBlockedUntil = 0; passwordStage = 'new';
+  updateNewPasswordLength(); show('password-dialog'); renderChangePin();
+  try {
+    const required = await updateOldPasswordField(), gate = required ? await getPasswordGate(vault) : null;
+    if (dialogToken !== passwordDialogGeneration || !key) return;
+    passwordStage = required ? 'old' : 'new'; passwordBlockedUntil = gate?.blockedUntil ?? 0;
+  } catch (error) { if (dialogToken === passwordDialogGeneration) { $('password-error').textContent = error.message; passwordStage = 'old'; } }
+  finally { if (dialogToken === passwordDialogGeneration) { passwordStageBusy = false; renderChangePin(); focusChangePin(); } }
+});
+$('password-dialog').addEventListener('close',() => { passwordDialogGeneration++; clearTimeout(passwordStageTimer); $('change-password-form').reset(); passwordStage = 'new'; passwordStageBusy = false; passwordBlockedUntil = 0; });
 $('change-password-form').addEventListener('submit',async e => {
-  e.preventDefault(); if (passwordChangeBusy || !requireOpen()) return;
+  e.preventDefault(); if (passwordChangeBusy || passwordStageBusy || passwordStage !== 'confirm' || !requireOpen()) return;
   const token = generation, dialogToken = passwordDialogGeneration;
   const submit = $('change-password-form').querySelector('button.primary');
   const newPassword = $('new-password').value, oldPassword = $('old-password').value;
-  passwordChangeBusy = true; submit.disabled = true; $('password-error').textContent = '';
+  passwordChangeBusy = true; submit.disabled = true; $('password-error').textContent = ''; renderChangePin();
   let savedPasswordResult = null;
   try {
     if (Array.from(newPassword).length !== Number($('new-password-length').value)) throw new Error('Введите ровно '+$('new-password-length').value+' символа.');
-    if (newPassword !== $('new-password-confirm').value) throw new Error('Пароли не совпадают.');
+    if (newPassword.toUpperCase() !== $('new-password-confirm').value.toUpperCase()) throw new Error('Пароли не совпадают.');
     const mustVerify = await updateOldPasswordField();
     if (mustVerify) {
       if (!oldPassword) throw new Error('Введите текущий мастер-пароль.');
@@ -824,9 +892,9 @@ $('change-password-form').addEventListener('submit',async e => {
     $('change-password-form').reset(); hide('password-dialog'); toast(result.locked ? 'Пароль изменён. Сессия завершена. Войдите с новым паролем.' : 'JSON перешифрован. Ключ доступа нужно привязать заново.');
   } catch (error) {
     if (savedPasswordResult?.committed) { hide('password-dialog'); toast('Пароль изменён. Откройте приложение заново и войдите с новым паролем.'); }
-    else if (dialogToken === passwordDialogGeneration) $('password-error').textContent = error.message;
+    else if (dialogToken === passwordDialogGeneration) rejectChangePin(error,$('old-password').required ? 'old' : 'new');
   }
-  finally { passwordChangeBusy = false; submit.disabled = false; }
+  finally { passwordChangeBusy = false; submit.disabled = false; renderChangePin(); focusChangePin(); }
 });
 for (const button of document.querySelectorAll('.close')) button.addEventListener('click',() => { const dialog=button.closest('dialog'); if(dialog.id==='camera-dialog')stopCamera(); if(dialog.id==='export-qr-dialog')clearExportQR(); dialog.close(); });
 $('edit-dialog').addEventListener('close',() => { $('secret').value = ''; $('secret').type = 'password'; $('show-secret').checked = false; });

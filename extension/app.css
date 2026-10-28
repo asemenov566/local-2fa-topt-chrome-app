@@ -74,3 +74,10 @@ body.lock-error #unlock-form,body.lock-error #unlock-passkey{display:none!import
 #pin-dots.shake{animation:pin-shake .6s both}
 @keyframes pin-shake{0%{transform:translateX(0)}12%{transform:translateX(-12px)}24%{transform:translateX(12px)}36%{transform:translateX(-10px)}48%{transform:translateX(8px)}60%{transform:translateX(-4px)}100%{transform:translateX(0)}}
 @media(prefers-reduced-motion:reduce){#pin-dots.shake{animation:none}}
+
+.change-pin-entry{position:relative;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;min-height:94px;margin:8px 0}
+#change-pin-dots{display:flex;gap:15px;align-items:center;justify-content:center;height:16px}
+#change-pin-prompt{margin:0;text-align:center;font-size:13px;line-height:18px}
+#password-dialog .change-pin-input{position:absolute;opacity:0;pointer-events:none;left:1px;top:1px;width:1px;height:1px;padding:0;margin:0;border:0}
+#change-pin-dots.shake{animation:pin-shake .6s both}
+@media(prefers-reduced-motion:reduce){#change-pin-dots.shake{animation:none}}

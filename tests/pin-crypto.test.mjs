@@ -31,6 +31,21 @@ test('4/6/12 character metadata survives portable encryption and is authenticate
  await assert.rejects(seal([],created.key,created.salt,1),/длина код-пароля/);
 });
 
+test('new passwords use uppercase while existing exact-case files remain readable',async()=>{
+ const password='aBc!23деFG45',created=await createKey(password);
+ const envelope=await seal([],created.key,created.salt,1,created.passwordLength);
+ for(const variant of [password,password.toUpperCase(),password.toLowerCase()])assert.equal((await unseal(envelope,variant)).passwordLength,12);
+ const expanded=await createKey('ßa1!');
+ const expandedEnvelope=await seal([],expanded.key,expanded.salt,1,expanded.passwordLength);
+ assert.equal((await unseal(expandedEnvelope,'ßA1!')).passwordLength,4);
+ const salt=crypto.getRandomValues(new Uint8Array(16)),original='aB!к';
+ const material=await crypto.subtle.importKey('raw',new TextEncoder().encode(original),'PBKDF2',false,['deriveKey']);
+ const legacyKey=await crypto.subtle.deriveKey({name:'PBKDF2',hash:'SHA-256',salt,iterations:600000},material,{name:'AES-GCM',length:256},true,['encrypt','decrypt']);
+ const legacy=await seal([],legacyKey,Buffer.from(salt).toString('base64'),1,4);
+ assert.equal((await unseal(legacy,original)).passwordLength,4);
+ await assert.rejects(unseal(legacy,original.toUpperCase()),e=>e.code==='INVALID_PASSWORD');
+});
+
 test('three wrong attempts share a persistent 60-second gate, success clears it',async()=>{
  store={};const created=await createKey('123456'),v=await seal([],created.key,created.salt,1,6);
  const realNow=Date.now;let now=1800000000000;Date.now=()=>now;

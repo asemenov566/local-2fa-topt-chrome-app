@@ -36,8 +36,8 @@ async function failedPasswordChange(){
   await page.evaluate(async()=>{globalThis.beforeChange={file:JSON.stringify(await(await import('./vault.js')).loadVault()),wrapper:JSON.stringify((await chrome.storage.local.get('deviceKey')).deviceKey)};});
   await page.locator('#settings-button').click();await page.locator('#change-password-open').click();
   await page.locator('#old-password').fill('1234');await page.locator('#new-password-length').selectOption('4');
-  await page.locator('#new-password').fill('4321');await page.locator('#new-password-confirm').fill('4321');fail=true;
-  await page.locator('#change-password-form button.primary').click();await page.waitForFunction(()=>document.querySelector('#password-error').textContent.includes('Synthetic'));
+  await page.locator('#new-password').fill('4321');fail=true;await page.locator('#new-password-confirm').fill('4321');
+  await page.waitForFunction(()=>document.querySelector('#password-error').textContent.includes('Synthetic'));
   const outcome=await page.evaluate(async()=>{
    const v=await import('./vault.js'),current=await v.loadVault();let oldOpens=false,newOpens=false;
    try{await v.unseal(current,'1234');oldOpens=true;}catch{}try{await v.unseal(current,'4321');newOpens=true;}catch{}
@@ -97,13 +97,13 @@ async function passwordCommittedAtExpiry(){
   // Isolate the commit/rememberKey race from the independent alarm and UI timeout.
   await worker.evaluate(async()=>{chrome.alarms.create=async()=>{};await chrome.alarms.clear('totp-session-expiry');});
   await page.locator('#settings-button').click();await page.locator('#change-password-open').click();await page.locator('#new-password-length').selectOption('4');
-  await page.locator('#new-password').fill('4321');await page.locator('#new-password-confirm').fill('4321');
+  await page.locator('#new-password').fill('4321');
   await page.evaluate(async()=>{
    const send=chrome.runtime.sendMessage.bind(chrome.runtime);chrome.runtime.sendMessage=m=>m?.type==='session-expire'?new Promise(()=>{}):send(m);
    const close=FileSystemWritableFileStream.prototype.close;FileSystemWritableFileStream.prototype.close=async function(...args){await close.apply(this,args);await new Promise(resolve=>setTimeout(resolve,1200));};
    const {uiUnlock}=await chrome.storage.session.get('uiUnlock');await chrome.storage.session.set({uiUnlock:{...uiUnlock,expiresAt:Date.now()+1000}});
   });
-  await page.locator('#change-password-form button.primary').click();await page.waitForFunction(()=>document.querySelector('#toast').textContent.includes('Пароль изменён. Сессия завершена.'));
+  await page.locator('#new-password-confirm').fill('4321');await page.waitForFunction(()=>document.querySelector('#toast').textContent.includes('Пароль изменён. Сессия завершена.'));
   const result=await page.evaluate(async()=>{
    const v=await import('./vault.js'),file=await v.loadVault(),session=await chrome.storage.session.get(['uiUnlock','manualLock']);let oldOpens=false,newOpens=false;
    try{await v.unseal(file,'1234');oldOpens=true;}catch{}try{await v.unseal(file,'4321');newOpens=true;}catch{}
@@ -120,7 +120,7 @@ async function stalePasswordCommitPreservesFreshLogin(){
   await context.exposeFunction('__testAfterDiskCommit',()=>{entered.resolve();return release.promise;});
   await first.evaluate(()=>{const close=FileSystemWritableFileStream.prototype.close;FileSystemWritableFileStream.prototype.close=async function(...args){await close.apply(this,args);await globalThis.__testAfterDiskCommit();};});
   await first.locator('#settings-button').click();await first.locator('#change-password-open').click();await first.locator('#new-password-length').selectOption('4');
-  await first.locator('#new-password').fill('5678');await first.locator('#new-password-confirm').fill('5678');await first.locator('#change-password-form button.primary').click();
+  await first.locator('#new-password').fill('5678');await first.locator('#new-password-confirm').fill('5678');
   await bounded(entered.promise,'Password file commit was not reached');
   const second=await context.newPage();await second.goto(base+'app.html?full=1');await second.locator('#password').fill('5678');await second.locator('#codes-screen').waitFor({state:'visible'});
   const fresh=await second.evaluate(async()=>{const {uiUnlock,lockEpoch}=await chrome.storage.session.get(['uiUnlock','lockEpoch']);return {authenticatedAt:uiUnlock.authenticatedAt,salt:uiUnlock.salt,lockEpoch};});

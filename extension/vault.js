@@ -20,7 +20,7 @@ export async function createKey(password) {
   if (typeof password !== 'string' || ![4,6,12].includes(Array.from(password).length)) throw new Error('Код-пароль должен содержать 4, 6 или 12 символов.');
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const passwordLength = Array.from(password).length;
-  return {key:await derive(password,salt),salt:to64(salt),passwordLength};
+  return {key:await derive(password.toUpperCase(),salt),salt:to64(salt),passwordLength};
 }
 function additionalData(salt,revision,passwordLength) {
   // The chosen code length is authenticated along with the vault revision.
@@ -40,8 +40,14 @@ export async function unseal(v,password) {
   if (typeof password !== 'string' || Array.from(password).length !== v.passwordLength) {
     const error = new Error('Неверный пароль или повреждённая резервная копия.'); error.code = 'INVALID_PASSWORD'; throw error;
   }
-  const key = await derive(password,from64(v.salt));
-  return unsealWithKey(v,key);
+  const normalized = password.toUpperCase(), salt = from64(v.salt);
+  try { return await unsealWithKey(v,await derive(normalized,salt)); }
+  catch (error) {
+    // Older files used the exact entered case. Keep them readable until their
+    // password is changed; new files always derive from the uppercase value.
+    if (error.code !== 'INVALID_PASSWORD' || normalized === password) throw error;
+    return unsealWithKey(v,await derive(password,salt));
+  }
 }
 export async function exportKey(key) { return to64(new Uint8Array(await crypto.subtle.exportKey('raw',key))); }
 export async function importKey(raw) { const bytes = from64(raw); if (bytes.length !== 32) throw new Error('Некорректный ключ устройства.'); return crypto.subtle.importKey('raw',bytes,{name:'AES-GCM'},true,['encrypt','decrypt']); }

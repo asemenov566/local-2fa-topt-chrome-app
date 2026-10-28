@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Local 2FA Authenticator",
-  "version": "1.5.1",
+  "version": "1.5.2",
   "description": "Локальный TOTP-аутентификатор: шифрование базы AES-256-GCM, импорт и экспорт QR, автоустановка кодов на выбранных сайтах.",
   "minimum_chrome_version": "120",
   "permissions": [
