@@ -35,6 +35,11 @@ test('a new strategy file registers metadata, binding validation and one isolate
   assert.ok(list.files.includes('extension/strategy/synthetic.js'));
   assert.ok(!list.files.some(file => file.includes('unrelated')));
   assert.equal(run('--check').status,0);
+  for (const file of ['extension/strategy/registry.js','extension/generated/synthetic.js','scripts/strategy-files.json']) {
+    const target = path.join(fixture,file);
+    await writeFile(target,(await readFile(target,'utf8')).replace(/\r?\n/g,'\r\n'));
+  }
+  assert.equal(run('--check').status,0,'Windows checkout line endings preserve generated content');
   await writeFile(path.join(fixture,'extension/generated/synthetic.js'),'stale');
   assert.notEqual(run('--check').status,0);
   await writeFile(path.join(fixture,'extension/strategy/synthetic.js'),source.replace('https://auth.example.test','http://auth.example.test'));

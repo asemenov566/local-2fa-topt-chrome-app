@@ -47,7 +47,8 @@ outputs.set('scripts/strategy-files.json',JSON.stringify({version:1,files},null,
 for (const [relative,content] of outputs) {
   const target = path.join(root,relative);
   if (check) {
-    if (await readFile(target,'utf8').catch(() => null) !== content) throw new Error('Generated strategy file is out of date: '+relative);
+    const existing = await readFile(target,'utf8').catch(() => null);
+    if (existing?.replace(/\r\n/g,'\n') !== content) throw new Error('Generated strategy file is out of date: '+relative);
   } else {
     await mkdir(path.dirname(target),{recursive:true});
     await writeFile(target,content,'utf8');
