@@ -13,8 +13,8 @@ Object.defineProperty(navigator,'locks',{configurable:true,value:{request(name,c
   const work=lockChain.then(callback);lockChain=work.catch(()=>{});return work;
 }}});
 
-test('4/6 character metadata survives portable encryption and is authenticated',async()=>{
- for(const password of ['1234','aB!кж6','🔒🔑aб']) {
+test('4/6/12 character metadata survives portable encryption and is authenticated',async()=>{
+ for(const password of ['1234','aB!кж6','🔒🔑aб','aБ!2🔒xyz-9К?']) {
   const created=await createKey(password),length=Array.from(password).length;
   assert.equal(created.passwordLength,length);
   const envelope=await seal([],created.key,created.salt,1,created.passwordLength);
@@ -26,7 +26,7 @@ test('4/6 character metadata survives portable encryption and is authenticated',
   await assert.rejects(unseal(removed,password),/длина код-пароля/);
   assert.throws(()=>validateEnvelope({...envelope,passwordLength:5}));
  }
- for(const invalid of ['','123','12345','1234567','Legacy-long-password-2026'])await assert.rejects(createKey(invalid),/4 или 6/);
+ for(const invalid of ['','123','12345','1234567','Legacy-long-password-2026'])await assert.rejects(createKey(invalid),/4, 6 или 12/);
  const created=await createKey('1234');
  await assert.rejects(seal([],created.key,created.salt,1),/длина код-пароля/);
 });

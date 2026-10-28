@@ -60,7 +60,7 @@ internal static class Host {
             if (!v.TryGetValue("passwordLength",out passwordLength)) throw new Exception();
             if (!(passwordLength is int || passwordLength is long || passwordLength is decimal || passwordLength is double)) throw new Exception();
             decimal length = Convert.ToDecimal(passwordLength);
-            if (length != 4m && length != 6m) throw new Exception();
+            if (length != 4m && length != 6m && length != 12m) throw new Exception();
         } catch { throw new Exception("Файл не является зашифрованной базой CHROME-APP-TOTP. Он не изменён."); }
         return v;
     }

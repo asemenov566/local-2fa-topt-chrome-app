@@ -58,7 +58,8 @@ body.pin-auth #password.pin-input{position:absolute;opacity:0;pointer-events:non
 .pin-dot.filled{background:var(--text)}
 #pin-prompt{font-size:12px;line-height:15px;margin:0;text-align:center;color:var(--muted)}
 body.pin-auth #unlock-error{font-size:10px;line-height:12px;margin:0;text-align:center;width:100%;max-height:24px;overflow-y:auto;flex-shrink:0}
-body.pin-auth #pin-length-label{position:absolute;bottom:calc(100% + 14px);display:flex;align-items:center;gap:8px;margin:0;font-size:11px;line-height:18px}
+body.pin-auth #pin-length-label{position:absolute;bottom:calc(100% + 14px);display:flex;align-items:center;justify-content:center;flex-wrap:wrap;width:100%;gap:2px 8px;margin:0;font-size:11px;line-height:18px}
+body.pin-auth #pin-length-label .muted{flex-basis:100%;text-align:center;font-size:10px;line-height:14px}
 body.pin-auth #pin-length{width:auto;font-size:11px;line-height:16px;height:22px;padding:0 5px;margin:0}
 body.pin-auth #unlock-passkey{margin:3px 0 0;width:auto;font-size:11px;line-height:15px;padding:2px 8px;border-radius:6px}
 body.pin-auth footer{display:block}

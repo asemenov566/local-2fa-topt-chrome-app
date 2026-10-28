@@ -6,7 +6,7 @@ const to64 = bytes => btoa(Array.from(bytes,b => String.fromCharCode(b)).join(''
 const from64 = s => Uint8Array.from(atob(s),c => c.charCodeAt(0));
 export function validateEnvelope(v) {
   if (!v || v.format !== 'chrome-app-totp-vault' || v.version !== 1 || v.kdf !== 'PBKDF2-SHA256' || v.iterations !== iterations || !Number.isSafeInteger(v.revision) || v.revision < 1) throw new Error('Неизвестный формат зашифрованной копии.');
-  if (![4,6].includes(v.passwordLength)) throw new Error('Некорректная длина код-пароля в файле.');
+  if (![4,6,12].includes(v.passwordLength)) throw new Error('Некорректная длина код-пароля в файле.');
   try {
     if (typeof v.salt !== 'string' || typeof v.iv !== 'string' || typeof v.ciphertext !== 'string' || v.ciphertext.length > 8000000 || from64(v.salt).length !== 16 || from64(v.iv).length !== 12 || from64(v.ciphertext).length < 16) throw new Error();
   } catch { throw new Error('Повреждена зашифрованная копия.'); }
@@ -17,7 +17,7 @@ async function derive(password,salt) {
   return crypto.subtle.deriveKey({name:'PBKDF2',hash:'SHA-256',salt,iterations},material,{name:'AES-GCM',length:256},true,['encrypt','decrypt']);
 }
 export async function createKey(password) {
-  if (typeof password !== 'string' || ![4,6].includes(Array.from(password).length)) throw new Error('Код-пароль должен содержать 4 или 6 символов.');
+  if (typeof password !== 'string' || ![4,6,12].includes(Array.from(password).length)) throw new Error('Код-пароль должен содержать 4, 6 или 12 символов.');
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const passwordLength = Array.from(password).length;
   return {key:await derive(password,salt),salt:to64(salt),passwordLength};
@@ -27,7 +27,7 @@ function additionalData(salt,revision,passwordLength) {
   return utf8.encode('chrome-app-totp-vault:1:'+salt+':'+revision+':passwordLength:'+passwordLength);
 }
 export async function seal(accounts, key, salt, revision, passwordLength) {
-  if (![4,6].includes(passwordLength)) throw new Error('Некорректная длина код-пароля.');
+  if (![4,6,12].includes(passwordLength)) throw new Error('Некорректная длина код-пароля.');
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const aad = additionalData(salt,revision,passwordLength);
   const plaintext = utf8.encode(JSON.stringify(accounts));
