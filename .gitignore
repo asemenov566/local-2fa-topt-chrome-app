@@ -1,0 +1,8 @@
+node_modules/
+work/
+outputs/
+*.vault.json
+*.vault
+native/com.asemenov566.chrome_app_totp.json
+*.y4m
+TEST-REPORT*.txt

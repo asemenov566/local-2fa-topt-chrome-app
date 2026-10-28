@@ -1,0 +1,19 @@
+CHROME-APP-TOTP bundles the following libraries locally; there is no runtime CDN loading.
+
+zxing-wasm 3.1.6 — QR decoding in an on-demand worker — MIT
+https://github.com/Sec-ant/zxing-wasm
+License: vendor/zxing-wasm.LICENSE
+ZXing C++ and WASM C++ bindings — Apache-2.0
+https://github.com/zxing-cpp/zxing-cpp
+Licenses: vendor/zxing-cpp.LICENSE, vendor/zxing-wasm-cpp.LICENSE
+
+qrcode 1.5.4 — QR generation — MIT
+https://github.com/soldair/node-qrcode
+License: vendor/qrcode.LICENSE
+
+dijkstrajs 1.0.3 — QR segment optimization dependency — MIT
+https://github.com/andrewhayward/dijkstra
+License: vendor/dijkstrajs.LICENSE
+
+The icon was drawn for CHROME-APP-TOTP and is not an official Google icon.
+CHROME-APP-TOTP is an independent application and is not affiliated with Google.

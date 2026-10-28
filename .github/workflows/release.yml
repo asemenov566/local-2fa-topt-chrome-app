@@ -1,0 +1,165 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Check release version
+        id: version
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $package = Get-Content package.json -Raw | ConvertFrom-Json
+          $lock = Get-Content package-lock.json -Raw | ConvertFrom-Json -AsHashtable
+          $manifest = Get-Content extension/manifest.json -Raw | ConvertFrom-Json
+          $version = [string] $package.version
+          if ($version -notmatch '^\d+\.\d+\.\d+$' -or
+              $manifest.version -ne $version -or
+              $lock.version -ne $version -or
+              $lock.packages[''].version -ne $version) {
+            throw 'package.json, package-lock.json and manifest.json must have the same release version.'
+          }
+          if (!(Test-Path -LiteralPath docs/release-notes.md -PathType Leaf) -or
+              [string]::IsNullOrWhiteSpace((Get-Content docs/release-notes.md -Raw))) {
+            throw 'Release notes are required.'
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+      - run: npm ci
+      - name: Prepare isolated test directories
+        run: New-Item -ItemType Directory -Force -Path work, outputs | Out-Null
+      - run: npm test
+      - run: npm run build:native
+      - run: npm run test:native
+      - run: npx playwright install chromium
+      - run: npm run test:browser
+      - name: Build release from the reviewed file allowlist
+        run: ./scripts/Build-Release.ps1
+      - name: Verify archive and checksum
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $name = "Local-2FA-Authenticator-$env:RELEASE_VERSION.zip"
+          $expected = (Get-FileHash -LiteralPath "outputs/$name" -Algorithm SHA256).Hash.ToLowerInvariant() + "  $name"
+          if ((Get-Content -LiteralPath outputs/SHA256SUMS.txt -Raw).Trim() -cne $expected) {
+            throw 'The release checksum does not match the ZIP.'
+          }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [IO.Compression.ZipFile]::OpenRead((Resolve-Path "outputs/$name"))
+          try {
+            $entries = @($zip.Entries.FullName)
+            foreach ($required in @('extension/manifest.json', 'native/CHROME-APP-TOTP.Host.exe', 'Install-Windows.cmd', 'INSTALL.md', 'LICENSE')) {
+              if ($required -notin $entries) { throw "Missing release entry: $required" }
+            }
+            foreach ($entry in $entries) {
+              if ($entry -match '(^|[/\\])(\.\.|node_modules|work|outputs|\.git)([/\\]|$)' -or
+                  $entry -match '^[/\\]|^[A-Za-z]:' -or
+                  $entry -match '\.vault(?:\.json)?$') {
+                throw 'The ZIP contains an unexpected path.'
+              }
+            }
+          } finally { $zip.Dispose() }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            outputs/Local-2FA-Authenticator-${{ steps.version.outputs.version }}.zip
+            outputs/SHA256SUMS.txt
+
+  publish:
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-${{ github.sha }}
+          path: release-assets
+      - name: Publish the verified commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_VERSION: ${{ needs.build.outputs.version }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = "v$env:RELEASE_VERSION"
+          $name = "Local-2FA-Authenticator-$env:RELEASE_VERSION.zip"
+          $zip = "release-assets/$name"
+          $checksums = 'release-assets/SHA256SUMS.txt'
+          $expected = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant() + "  $name"
+          if ((Get-Content -LiteralPath $checksums -Raw).Trim() -cne $expected) {
+            throw 'The downloaded release checksum does not match the ZIP.'
+          }
+
+          $refsJson = gh api "repos/$env:GH_REPO/git/matching-refs/tags/$tag"
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot check existing tags.' }
+          $refs = $refsJson | ConvertFrom-Json
+          if (@($refs | Where-Object { $_.ref -eq "refs/tags/$tag" }).Count -gt 0) {
+            throw "Tag $tag already exists; it will not be overwritten."
+          }
+          $tags = @(gh api --paginate "repos/$env:GH_REPO/releases?per_page=100" --jq '.[].tag_name')
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot check existing releases.' }
+          if ($tag -in $tags) { throw "Release $tag already exists; it will not be overwritten." }
+
+          gh api --method POST "repos/$env:GH_REPO/git/refs" -f "ref=refs/tags/$tag" -f "sha=$env:RELEASE_SHA" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot create the exact release tag; existing tags are never overwritten.' }
+
+          gh release create $tag $zip $checksums --repo $env:GH_REPO --verify-tag --target $env:RELEASE_SHA --title "Local 2FA Authenticator $env:RELEASE_VERSION" --notes-file docs/release-notes.md --latest
+          if ($LASTEXITCODE -ne 0) { throw 'Release creation failed; inspect the release before retrying.' }
+
+          $refJson = gh api "repos/$env:GH_REPO/git/ref/tags/$tag"
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot verify the release tag.' }
+          $ref = $refJson | ConvertFrom-Json
+          if ($ref.object.type -ne 'commit' -or $ref.object.sha -ne $env:RELEASE_SHA) {
+            throw 'The release tag does not point to the checked commit.'
+          }
+          $releaseJson = gh api "repos/$env:GH_REPO/releases/tags/$tag"
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot verify the published release.' }
+          $release = $releaseJson | ConvertFrom-Json
+          $notes = (Get-Content docs/release-notes.md -Raw).Replace("`r`n", "`n").Trim()
+          if ($release.draft -or $release.prerelease -or $release.tag_name -ne $tag -or
+              $release.body.Replace("`r`n", "`n").Trim() -cne $notes -or
+              @($release.assets).Count -ne 2) {
+            throw 'The published release metadata does not match this build.'
+          }
+          foreach ($asset in @(@{ Name = $name; Path = $zip }, @{ Name = 'SHA256SUMS.txt'; Path = $checksums })) {
+            $remote = @($release.assets | Where-Object { $_.name -eq $asset.Name })
+            if ($remote.Count -ne 1 -or $remote[0].state -ne 'uploaded' -or
+                $remote[0].size -ne (Get-Item -LiteralPath $asset.Path).Length) {
+              throw 'A release asset is missing or incomplete.'
+            }
+          }

@@ -1,0 +1,41 @@
+{
+  "manifest_version": 3,
+  "name": "Local 2FA Authenticator",
+  "version": "1.4.3",
+  "description": "Локальный TOTP-аутентификатор: шифрование базы AES-256-GCM, импорт и экспорт QR, автоустановка кодов на выбранных сайтах.",
+  "minimum_chrome_version": "120",
+  "permissions": [
+    "storage",
+    "activeTab",
+    "clipboardWrite",
+    "scripting",
+    "nativeMessaging"
+  ],
+  "optional_host_permissions": [
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Local 2FA Authenticator",
+    "default_popup": "app.html",
+    "default_icon": {
+      "16": "icons/16.png",
+      "32": "icons/32.png",
+      "48": "icons/48.png",
+      "128": "icons/128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/16.png",
+    "32": "icons/32.png",
+    "48": "icons/48.png",
+    "128": "icons/128.png"
+  },
+  "content_security_policy": {
+    "extension_pages": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'"
+  },
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAp3pVwaY/aQc0jr3daEUczi93NFI9UOzAfGtpopR7Sf7C9aAR/j4PyAcBY0Qc7lw2fy3FLYb26Mutq0R7vEVdAabtrSteePjW9nQmfSJv5sL+sSEP4p26q3pwVQjv2Uz800zVgRTaCvnoydLLHjOW6Z2hjsFCpujqW3++utYu0HargWoI1vpVoeqKaDnEqBCDwOHzCTX09dyDQ4p/paKICdO0gbY0icJpqGQJOIMCUacQ9upIXFfdi7fb6jjsiw3SXw27MCfqbdya4Mqsq0I+0R/WbOnsQRKPsBND8/IFYOEYVPJg5aVKA2ZjtpEokGZMYGAuEkoyZwTtPXbvQ+pNeQIDAQAB"
+}
